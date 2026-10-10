@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["engine", "testlab"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+tokio = { version = "1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"

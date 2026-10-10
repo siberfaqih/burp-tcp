@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+
+# Clean-room boundary: proprietary and reverse-engineering material stays local.
+/analysis/
+/InterceptSuite Pro/
+/reports/
+/research_notes/
+
+# Task specification / prompt documents (kept local)
+/ARCHITECTURE.md
+/CLEANROOM_RE_FINDINGS.md
+/CURRENT_TASK.md
+/ROADMAP.md
+/state/PROGRESS.md
+/state/PROJECT_STATE.md
+
+# macOS
+.DS_Store

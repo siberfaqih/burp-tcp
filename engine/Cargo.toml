@@ -1,0 +1,25 @@
+[package]
+name = "rawtcp-engine"
+description = "Standalone SOCKS5 CONNECT relay (Phase 1A)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "rawtcp_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rawtcp-engine"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+testlab = { path = "../testlab" }
+socket2 = "0.6"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

@@ -1,0 +1,11 @@
+[package]
+name = "testlab"
+description = "Local Phase 1A test lab: TCP fixtures and a SOCKS5-aware client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time", "sync"] }
