@@ -24,7 +24,7 @@ cd extension
 mvn clean verify          # compiles proto, runs tests, produces the jar
 ```
 
-Output: `target/rawtcp-burp-extension-0.1.0.jar` — a single shaded jar with
+Output: `target/rawtcp-burp-extension-0.1.2.jar` — a single shaded jar with
 `protobuf-java` bundled and the Montoya API excluded (Burp supplies it).
 
 The canonical schema `../proto/burp_tcp.proto` is compiled by `protoc`

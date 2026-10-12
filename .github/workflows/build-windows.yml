@@ -76,21 +76,21 @@ jobs:
             "dist\rawtcp-engine.exe"
 
           Copy-Item `
-            "extension\target\rawtcp-burp-extension-0.1.0.jar" `
-            "dist\rawtcp-burp-extension-0.1.0.jar"
+            "extension\target\rawtcp-burp-extension-0.1.2.jar" `
+            "dist\rawtcp-burp-extension-0.1.2.jar"
 
           $engineHash = (Get-FileHash `
             "dist\rawtcp-engine.exe" `
             -Algorithm SHA256).Hash.ToLower()
 
           $extensionHash = (Get-FileHash `
-            "dist\rawtcp-burp-extension-0.1.0.jar" `
+            "dist\rawtcp-burp-extension-0.1.2.jar" `
             -Algorithm SHA256).Hash.ToLower()
 
           "$engineHash  rawtcp-engine.exe" |
             Out-File -Encoding ascii dist\SHA256SUMS.txt
 
-          "$extensionHash  rawtcp-burp-extension-0.1.0.jar" |
+          "$extensionHash  rawtcp-burp-extension-0.1.2.jar" |
             Out-File -Encoding ascii -Append dist\SHA256SUMS.txt
 
           Get-ChildItem dist
