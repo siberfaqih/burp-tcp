@@ -19,13 +19,14 @@ public final class FormBody {
     }
 
     private FormBody(String headers, List<Field> fields) {
-        this(headers, fields, "");
+        this(headers, fields, "", false);
     }
 
-    private FormBody(String headers, List<Field> fields, String suffix) {
+    private FormBody(String headers, List<Field> fields, String suffix, boolean normalized) {
         this.headers = headers;
         this.fields = List.copyOf(fields);
         this.suffix = suffix;
+        this.normalized = normalized;
     }
 
     public static FormBody parse(byte[] bytes) {
@@ -34,6 +35,29 @@ public final class FormBody {
         // Pasted requests often use LF-only line endings; accept both styles
         // but always rebuild with the original one.
         String eol = source.contains("\r\n") ? "\r\n" : "\n";
+        try {
+            return parseEol(source, eol, false);
+        } catch (IllegalArgumentException first) {
+            // A single damaged line ending (e.g. a Delete keystroke eating the
+            // CR of a CRLF pair) breaks structural parsing without changing
+            // intent. Retry on a line-ending-normalized view so the sidebar
+            // keeps working; any edit from that view normalizes endings.
+            String flat = source.replace("\r\n", "\n").replace('\r', '\n');
+            if (flat.equals(source)) throw first;
+            try {
+                return parseEol(flat, "\n", true);
+            } catch (IllegalArgumentException second) {
+                throw first; // Report the accurate error for the actual bytes.
+            }
+        }
+    }
+
+    /** Whether this form was parsed from line-ending-normalized text. */
+    public boolean isNormalized() { return normalized; }
+
+    private final boolean normalized;
+
+    private static FormBody parseEol(String source, String eol, boolean normalized) {
         String headers = "";
         String body = source;
         String suffix = "";
@@ -101,7 +125,7 @@ public final class FormBody {
             fields.add(new Field(rawName, rawValue, equals >= 0,
                     UrlCodec.decode(rawName, true), UrlCodec.decode(rawValue, true)));
         }
-        return new FormBody(headers, fields, suffix);
+        return new FormBody(headers, fields, suffix, normalized);
     }
 
     public List<Field> fields() { return fields; }
@@ -113,7 +137,7 @@ public final class FormBody {
         String key = name.equals(field.name()) ? field.rawName() : encodeLike(name, field.rawName());
         String val = value.equals(field.value()) ? field.rawValue() : encodeLike(value, field.rawValue());
         next.set(row, new Field(key, val, field.equalsSign() || !value.isEmpty(), name, value));
-        return new FormBody(headers, next, suffix);
+        return new FormBody(headers, next, suffix, normalized);
     }
 
     private static String encodeLike(String text, String previous) {

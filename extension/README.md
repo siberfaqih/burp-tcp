@@ -153,6 +153,15 @@ The raw editor's **URL encode / URL decode** buttons manually transform selected
 UTF-8 text (or all text when nothing is selected). These are explicit wire edits;
 use the parameter sidebar for automatic decode → edit → re-encode behavior.
 
+Text mode maintains a complete single-`Content-Length` HTTP message: body
+edits update the header automatically on send (announced inline), so the
+sidebar never blanks on a stale length and Forward transmits a consistent
+message. A damaged line ending (e.g. a keystroke eating the CR of a CRLF
+pair) falls back to a normalized view marked `line endings normalized`;
+editing from that view rebuilds clean bytes. Hex mode and non-UTF-8 previews
+always send exact bytes — deliberate framing probes belong there, never
+rewritten.
+
 Traffic tables show destination, traffic direction, byte size, time and a readable
 preview. Unit IDs, sequence numbers, offsets and revisions are available as row
 tooltips rather than primary columns.

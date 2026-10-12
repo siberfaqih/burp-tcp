@@ -179,8 +179,7 @@ class BodyEditingTest {
         });
     }
 
-    @Test void pastedLfOnlyHttpRequestShowsParameters() throws Exception {
-        edt(() -> {
+    @Test void pastedLfOnlyHttpRequestShowsParameters() throws Exception {        edt(() -> {
             BinaryEditorPanel editor = new BinaryEditorPanel();
             String wire = "POST /login HTTP/1.1\nHost: localhost\n"
                     + "Content-Type: application/x-www-form-urlencoded\n"
@@ -190,6 +189,59 @@ class BodyEditingTest {
             assertArrayEquals(bytes(wire), editor.getBytes());
             assertEquals(2, editor.parameters().table().getRowCount());
             assertEquals("Ali", editor.parameters().table().getValueAt(0, 1));
+        });
+    }
+
+    @Test void rawTextBodyEditKeepsSidebarPopulated() throws Exception {
+        AtomicReference<BinaryEditorPanel> ref = new AtomicReference<>();
+        edt(() -> {
+            BinaryEditorPanel editor = new BinaryEditorPanel();
+            String wire = "POST /login HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length:  3\r\n\r\na=1";
+            editor.setBytes(bytes(wire), false);
+            ref.set(editor);
+        });
+        flush();
+        edt(() -> {
+            assertEquals(1, ref.get().parameters().table().getRowCount());
+            BinaryEditorPanel editor = ref.get();
+            editor.textArea().setText(editor.textArea().getText().replace("a=1", "a=1&b=2"));
+        });
+        flush();
+        edt(() -> {
+            // The length-corrected view parses: the sidebar stays populated.
+            assertEquals(2, ref.get().parameters().table().getRowCount());
+            assertEquals("1", ref.get().parameters().table().getValueAt(0, 1));
+            assertEquals("2", ref.get().parameters().table().getValueAt(1, 1));
+        });
+    }
+
+    @Test void damagedLineEndingFallsBackToNormalizedView() throws Exception {
+        edt(() -> {
+            BinaryEditorPanel editor = new BinaryEditorPanel();
+            // A Delete keystroke eating the CR of a CRLF pair leaves \n\r\n.
+            String damaged = "POST /login HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length:  3\n\r\na=1";
+            editor.setBytes(bytes(damaged), false);
+            assertEquals(1, editor.parameters().table().getRowCount());
+            assertEquals("1", editor.parameters().table().getValueAt(0, 1));
+            // Editing from the normalized view rebuilds clean LF bytes.
+            editor.parameters().table().setValueAt("2", 0, 1);
+            assertEquals("POST /login HTTP/1.1\nContent-Type: application/x-www-form-urlencoded\nContent-Length:  3\n\na=2",
+                    text(editor.getBytes()));
+        });
+    }
+
+    @Test void textModeSendAutoFixesContentLengthWhileHexStaysExact() throws Exception {
+        edt(() -> {
+            String wire = "POST /login HTTP/1.1\r\nContent-Length:  3\r\n\r\na=1";
+            BinaryEditorPanel text = new BinaryEditorPanel();
+            text.setBytes(bytes(wire), false);
+            text.textArea().setText(wire.replace("a=1", "a=1&b=2"));
+            assertEquals(wire.replace("Content-Length:  3", "Content-Length:  7").replace("a=1", "a=1&b=2"),
+                    text(text.getBytes()));
+            BinaryEditorPanel hex = new BinaryEditorPanel();
+            hex.setBytes(bytes(wire), true);
+            hex.textArea().setText(hex.textArea().getText());
+            assertArrayEquals(bytes(wire), hex.getBytes());
         });
     }
 }

@@ -64,4 +64,23 @@ class HttpLengthTest {
         String fixed = "POST /login HTTP/1.1\nContent-Length: 7\n\na=1&b=2";
         assertNull(HttpLength.checkReplace(bytes(original), bytes(fixed)));
     }
+
+    @Test void fixContentLengthCorrectsStaleDeclarations() {
+        assertEquals("POST /x HTTP/1.1\r\nContent-Length:  7\r\n\r\na=1&b=2",
+                new String(HttpLength.fixContentLength(bytes("POST /x HTTP/1.1\r\nContent-Length:  3\r\n\r\na=1&b=2")),
+                        StandardCharsets.UTF_8));
+        assertEquals("POST /x HTTP/1.1\nContent-Length: 7\n\na=1&b=2",
+                new String(HttpLength.fixContentLength(bytes("POST /x HTTP/1.1\nContent-Length: 3\n\na=1&b=2")),
+                        StandardCharsets.UTF_8));
+    }
+
+    @Test void fixContentLengthLeavesEverythingElseAlone() {
+        // Already consistent.
+        assertNull(HttpLength.fixContentLength(bytes("POST /x HTTP/1.1\r\nContent-Length:  3\r\n\r\na=1")));
+        // Chunked, multi-message-shaped, and non-HTTP bytes are never rewritten.
+        assertNull(HttpLength.fixContentLength(
+                bytes("POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n")));
+        assertNull(HttpLength.fixContentLength(bytes("a=1&b=2")));
+        assertNull(HttpLength.fixContentLength(new byte[] {0x12, 0x01, 0x00}));
+    }
 }

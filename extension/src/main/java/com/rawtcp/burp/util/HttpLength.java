@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Pattern;
 
 /**
  * Consistency guard for complete HTTP/1.x messages held as a single unit.
@@ -58,6 +59,39 @@ public final class HttpLength {
                     + "Fix the header or edit via Body parameters (which updates it automatically).";
         }
         return null;
+    }
+
+    /**
+     * Correct a stale single {@code Content-Length} on an otherwise complete
+     * HTTP/1.x message (CRLF or LF-only).
+     *
+     * @return a copy with the declared length set to the actual body length,
+     *     or {@code null} when the bytes are not such a message or already
+     *     agree. Never touches chunked/compressed bodies, multi-message
+     *     payloads, or non-HTTP bytes: those are returned untouched so an
+     *     explicit byte-level intent (Hex mode, smuggling probes) survives.
+     */
+    public static byte[] fixContentLength(byte[] bytes) {
+        Message message = parse(bytes);
+        if (message == null || message.contentLengths.size() != 1 || message.framed) {
+            return null;
+        }
+        long declared = message.contentLengths.get(0);
+        long actual = bytes.length - message.headerEnd;
+        if (declared == actual) {
+            return null;
+        }
+        String headers = new String(bytes, 0, message.headerEnd, StandardCharsets.ISO_8859_1);
+        java.util.regex.Matcher length = Pattern.compile("(?im)^(Content-Length:[ \\t]*)([0-9]+)")
+                .matcher(headers);
+        if (!length.find()) {
+            return null;
+        }
+        String fixed = headers.substring(0, length.start(2)) + actual + headers.substring(length.end(2));
+        byte[] out = new byte[fixed.length() + bytes.length - message.headerEnd];
+        System.arraycopy(fixed.getBytes(StandardCharsets.ISO_8859_1), 0, out, 0, fixed.length());
+        System.arraycopy(bytes, message.headerEnd, out, fixed.length(), bytes.length - message.headerEnd);
+        return out;
     }
 
     private static final class Message {

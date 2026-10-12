@@ -3,7 +3,6 @@ package com.rawtcp.burp.ui;
 import com.rawtcp.burp.ipc.ControlPlane;
 import com.rawtcp.burp.ipc.proto.BurpTcp;
 import com.rawtcp.burp.util.Display;
-import com.rawtcp.burp.util.HttpLength;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
@@ -330,13 +329,8 @@ public final class InterceptPanel extends JPanel {
             byte[] bytes = editor.getBytes();
             byte[] original = editing.getBytes().toByteArray();
             boolean changed = !Arrays.equals(bytes, original);
-            if (changed) {
-                String framing = HttpLength.checkReplace(original, bytes);
-                if (framing != null) {
-                    notifier.accept(framing);
-                    return;
-                }
-            }
+            // Text-mode Content-Length maintenance already happened inside
+            // getBytes; Hex mode sends exact bytes by contract.
             decide(editing, changed ? BurpTcp.InterceptActionKind.REPLACE
                     : BurpTcp.InterceptActionKind.FORWARD, changed ? bytes : null);
         } catch (IllegalArgumentException invalid) {

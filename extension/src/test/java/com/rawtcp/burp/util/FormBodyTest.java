@@ -82,6 +82,29 @@ class FormBodyTest {
         assertEquals("a=one+two&b=%2F%252F\n", edited);
     }
 
+    @Test void damagedLineEndingFallsBackToNormalizedView() {
+        // One Delete keystroke eating the CR of a CRLF pair leaves \n\r\n.
+        String damaged = "POST /x HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length:  3\n\r\na=1";
+        FormBody form = FormBody.parse(bytes(damaged));
+        assertTrue(form.isNormalized());
+        assertEquals("1", form.fields().get(0).value());
+        // An edit from the normalized view rebuilds clean LF bytes.
+        assertEquals("POST /x HTTP/1.1\nContent-Type: application/x-www-form-urlencoded\nContent-Length:  3\n\na=2",
+                text(form.edit(0, "a", "2").bytes()));
+        assertFalse(FormBody.parse(bytes("POST /x HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length:  3\r\n\r\na=1")).isNormalized());
+    }
+
+    @Test void genuinelyBrokenMessagesStillReportTheOriginalError() {
+        // Truncated headers with no recoverable structure: strict error stands.
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> FormBody.parse(bytes("POST /x HTTP/1.1\r\nHost: h")));
+        assertTrue(error.getMessage().contains("no blank line"), error.getMessage());
+        // Stale length on clean endings is not a line-ending problem.
+        IllegalArgumentException stale = assertThrows(IllegalArgumentException.class,
+                () -> FormBody.parse(bytes("POST /x HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length:  99\r\n\r\na=1")));
+        assertTrue(stale.getMessage().contains("Partial or multiple"), stale.getMessage());
+    }
+
     @Test void urlToolsDecodeExactlyOneLayerAndDistinguishPlusFromSpace() {
         assertEquals("%2F+ test", UrlCodec.decode("%252F%2B+test", true));
         assertEquals("a+b", UrlCodec.decode("a+b", false));

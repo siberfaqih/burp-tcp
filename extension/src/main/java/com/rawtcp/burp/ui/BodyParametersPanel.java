@@ -44,7 +44,9 @@ final class BodyParametersPanel extends JPanel {
         editError = null;
         try {
             form = FormBody.parse(bytes);
-            message(form.isHttp() ? "Form body · Content-Length updated automatically" : "Form fields in this TCP chunk");
+            String where = form.isHttp() ? "Form body · Content-Length updated automatically" : "Form fields in this TCP chunk";
+            if (form.isNormalized()) where += " · line endings normalized";
+            message(where);
         } catch (IllegalArgumentException error) {
             form = null;
             message(error.getMessage());

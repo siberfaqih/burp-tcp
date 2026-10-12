@@ -403,9 +403,8 @@ class InterceptPanelTest {
     }
 
     @Test
-    void rawTextEditWithStaleContentLengthIsBlockedBeforeSending() throws Exception {
+    void rawTextEditAutoFixesStaleContentLengthOnForward() throws Exception {
         FakeControlPlane fake = new FakeControlPlane();
-        List<String> notices = new CopyOnWriteArrayList<>();
         String wire = "POST /login HTTP/1.1\r\nContent-Length:  3\r\n\r\na=1";
         fake.pendingResult = CompletableFuture.completedFuture(BurpTcp.PendingList.newBuilder()
                 .addUnits(BurpTcp.PendingUnitInfo.newBuilder()
@@ -416,7 +415,7 @@ class InterceptPanelTest {
         AtomicReference<InterceptPanel> ref = new AtomicReference<>();
         onEdt(() -> {
             InterceptPanel panel = new InterceptPanel(fake);
-            panel.setNotifier(notices::add);
+            panel.setNotifier(message -> { });
             panel.setConnected(true);
             panel.refreshAll();
             ref.set(panel);
@@ -431,8 +430,11 @@ class InterceptPanelTest {
         flush();
         onEdt(() -> ref.get().forwardEdited());
 
-        assertTrue(fake.decideCalls.isEmpty(), "stale Content-Length must not leave the UI");
-        assertTrue(notices.stream().anyMatch(m -> m.contains("Content-Length says 3 but the body is 7 bytes")),
-                "expected a framing error, got " + notices);
+        // Text mode maintains Content-Length: the edit is sent with a fixed header.
+        assertEquals(1, fake.decideCalls.size());
+        BurpTcp.Decide decide = fake.decideCalls.getFirst();
+        assertEquals(BurpTcp.InterceptActionKind.REPLACE, decide.getAction());
+        assertEquals(wire.replace("Content-Length:  3", "Content-Length:  7").replace("a=1", "a=1&b=2"),
+                decide.getReplaceBytes().toStringUtf8());
     }
 }

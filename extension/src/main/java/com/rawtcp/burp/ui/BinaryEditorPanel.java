@@ -1,6 +1,7 @@
 package com.rawtcp.burp.ui;
 
 import com.rawtcp.burp.util.HexText;
+import com.rawtcp.burp.util.HttpLength;
 import com.rawtcp.burp.util.UrlCodec;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
@@ -160,14 +161,45 @@ public final class BinaryEditorPanel extends JPanel {
     }
 
     private void syncParameters() {
-        try { parameters.setPayload(readWireBytes()); }
-        catch (IllegalArgumentException invalid) { parameters.unavailable(invalid.getMessage()); }
+        byte[] wire;
+        try { wire = readWireBytes(); }
+        catch (IllegalArgumentException invalid) { parameters.unavailable(invalid.getMessage()); return; }
+        // Parse the length-corrected view so a raw-text body edit never
+        // blanks the sidebar: the fix is what Forward/Send will transmit.
+        byte[] fixed = smartBytes(wire);
+        parameters.setPayload(fixed != null ? fixed : wire);
+    }
+
+    /**
+     * Length-corrected bytes for Text mode, or {@code null} when no
+     * correction applies. Hex mode and non-UTF-8 previews are always exact:
+     * explicit bytes (smuggling probes included) are never rewritten.
+     */
+    private byte[] smartBytes(byte[] wire) {
+        if (displayedHex || preservedBytes != null) return null;
+        return HttpLength.fixContentLength(wire);
     }
 
     public byte[] getBytes() {
         syncParameters();
         parameters.commitEditing(); // includes a cell still being edited when Forward is clicked
-        return readWireBytes();
+        byte[] raw = readWireBytes();
+        byte[] fixed = smartBytes(raw);
+        if (fixed != null) {
+            notice.setText("Content-Length auto-updated to " + (fixed.length - headerLength(fixed))
+                    + " on send; Hex mode sends exact bytes");
+            return fixed;
+        }
+        return raw;
+    }
+
+    private static int headerLength(byte[] message) {
+        for (int i = 0; i + 3 < message.length; i++) {
+            if (message[i] == '\r' && message[i + 1] == '\n' && message[i + 2] == '\r' && message[i + 3] == '\n')
+                return i + 4;
+            if (message[i] == '\n' && message[i + 1] == '\n') return i + 2;
+        }
+        return 0;
     }
 
     private byte[] readWireBytes() {
