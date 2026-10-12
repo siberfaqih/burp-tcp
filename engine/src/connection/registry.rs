@@ -6,7 +6,7 @@
 //! request parsing are attacker-controlled in length and timing.
 
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{atomic::AtomicU64, Arc, Mutex};
 
 use uuid::Uuid;
 
@@ -34,6 +34,10 @@ pub struct Connection {
     pub requested_port: Option<u16>,
     /// Current lifecycle state.
     pub state: ConnectionState,
+    /// Forwarded bytes, independent of lossy history retention.
+    pub bytes_c2s: Arc<AtomicU64>,
+    /// Forwarded bytes in the reverse direction.
+    pub bytes_s2c: Arc<AtomicU64>,
 }
 
 /// Result of trying to admit an accepted socket.
@@ -51,6 +55,7 @@ pub enum Admission {
 pub struct ConnectionRegistry {
     connections: Mutex<Vec<Connection>>,
     max_active: usize,
+    accepted: AtomicU64,
 }
 
 impl ConnectionRegistry {
@@ -59,6 +64,7 @@ impl ConnectionRegistry {
         Self {
             connections: Mutex::new(Vec::new()),
             max_active: max_active.max(1),
+            accepted: AtomicU64::new(0),
         }
     }
 
@@ -81,21 +87,23 @@ impl ConnectionRegistry {
             requested_target: None,
             requested_port: None,
             state: ConnectionState::Negotiating,
+            bytes_c2s: Arc::new(AtomicU64::new(0)),
+            bytes_s2c: Arc::new(AtomicU64::new(0)),
         };
-        let id = connection.id.clone();
-        guard.push(connection);
-        Admission::Admitted(Connection {
-            id,
-            client_addr,
-            requested_target: None,
-            requested_port: None,
-            state: ConnectionState::Negotiating,
-        })
+        guard.push(connection.clone());
+        self.accepted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Admission::Admitted(connection)
     }
 
     /// Current active connection count.
     pub fn active(&self) -> usize {
         self.lock().len()
+    }
+
+    /// Admitted SOCKS sockets since this engine started, including negotiation.
+    pub fn accepted(&self) -> u64 {
+        self.accepted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Maximum concurrent connections allowed by configuration.
@@ -125,6 +133,14 @@ impl ConnectionRegistry {
     pub fn mark_forwarding(&self, id: &str) {
         self.update(id, |connection| {
             connection.state = ConnectionState::Forwarding;
+        });
+    }
+
+    /// Attach the transport's lifetime counters before forwarding starts.
+    pub fn set_counters(&self, id: &str, c2s: Arc<AtomicU64>, s2c: Arc<AtomicU64>) {
+        self.update(id, |connection| {
+            connection.bytes_c2s = c2s;
+            connection.bytes_s2c = s2c;
         });
     }
 

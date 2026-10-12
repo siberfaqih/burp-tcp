@@ -94,9 +94,9 @@ pub struct HistorySnapshot {
     pub conn_id: String,
     #[prost(enumeration = "Direction", tag = "2")]
     pub direction: i32,
-    /// 0 = all chunks; otherwise only the newest N are returned and
-    /// [`HistoryData::total_chunks`] reports the retained count. Bounds
-    /// snapshot cost so a bulk transfer cannot wedge the control plane.
+    /// Per-direction newest chunk count; 0 = server default. The server
+    /// enforces 300 chunks / 1 MiB per direction even for legacy clients.
+    /// [`HistoryData::total_chunks`] reports the retained count before limits.
     #[prost(uint32, tag = "3")]
     pub max_chunks: u32,
 }
@@ -327,6 +327,14 @@ pub struct Stats {
     pub s2c_enabled: bool,
     #[prost(uint64, tag = "9")]
     pub ipc_dropped_events: u64,
+    #[prost(uint64, tag = "10")]
+    pub history_dropped_chunks: u64,
+    #[prost(uint64, tag = "11")]
+    pub history_dropped_bytes: u64,
+    #[prost(uint64, tag = "12")]
+    pub accepted_connections: u64,
+    #[prost(uint64, tag = "13")]
+    pub active_connections: u64,
 }
 
 // --- Events ---

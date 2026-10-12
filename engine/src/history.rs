@@ -61,7 +61,7 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime};
 
 use uuid::Uuid;
@@ -148,6 +148,19 @@ pub struct ConnectionClose {
     /// Total bytes forwarded server -> client, as reported by transport.
     pub bytes_server_to_client: u64,
     /// Why forwarding stopped.
+    pub reason: String,
+}
+
+/// A SOCKS session that ended before an upstream connection was established.
+#[derive(Debug, Clone)]
+pub struct ConnectionRejected {
+    /// Admitted connection ID.
+    pub conn_id: String,
+    /// Requested host, empty if negotiation never supplied it.
+    pub requested_target: String,
+    /// Requested port, zero if unknown.
+    pub requested_port: u16,
+    /// Negotiation or connect failure, including SOCKS reply code when known.
     pub reason: String,
 }
 
@@ -243,6 +256,8 @@ pub trait HistorySink: Send + Sync + 'static {
     fn record_chunk(&self, chunk: TrafficChunk);
     /// Record that a session stopped forwarding.
     fn record_connection_close(&self, conn_id: &str, close: ConnectionClose);
+    /// Retain failed connection attempts as metadata, without inventing traffic.
+    fn record_connection_rejected(&self, _rejected: ConnectionRejected) {}
 }
 
 /// Shared history handle.
@@ -279,7 +294,7 @@ impl ConnCursors {
 /// metadata, and concurrent snapshots never block one another.
 #[derive(Debug, Default)]
 struct ChunkStore {
-    chunks: VecDeque<TrafficChunk>,
+    chunks: VecDeque<Arc<TrafficChunk>>,
     bytes_retained: u64,
 }
 
@@ -290,6 +305,10 @@ struct ChunkStore {
 /// for a snapshot reader.
 #[derive(Debug)]
 enum ConnOp {
+    Rejected {
+        rejected: ConnectionRejected,
+        at: RecordTime,
+    },
     Open {
         open: ConnectionOpen,
         at: RecordTime,
@@ -406,29 +425,72 @@ impl MemoryHistory {
     /// Note: retention order is global push order, which interleaves
     /// directions and connections. Use per-direction `seq` for stream order.
     pub fn chunks(&self) -> Vec<TrafficChunk> {
-        self.read_chunks().chunks.iter().cloned().collect()
+        let handles: Vec<_> = self.read_chunks().chunks.iter().cloned().collect();
+        handles.iter().map(|chunk| (**chunk).clone()).collect()
     }
 
     /// Snapshot of retained chunks for one connection, oldest first.
     pub fn chunks_for(&self, conn_id: &str) -> Vec<TrafficChunk> {
-        self.read_chunks()
+        let handles: Vec<_> = self
+            .read_chunks()
             .chunks
             .iter()
             .filter(|chunk| chunk.conn_id == conn_id)
             .cloned()
-            .collect()
+            .collect();
+        handles.iter().map(|chunk| (**chunk).clone()).collect()
     }
 
     /// Snapshot of retained chunks for one connection and direction, oldest
     /// first. Only lossless retention reconstructs the entire delivered
     /// stream; otherwise use offsets and final counters to locate gaps.
     pub fn chunks_for_direction(&self, conn_id: &str, direction: Direction) -> Vec<TrafficChunk> {
-        self.read_chunks()
+        let handles: Vec<_> = self
+            .read_chunks()
             .chunks
             .iter()
             .filter(|chunk| chunk.conn_id == conn_id && chunk.direction == direction)
             .cloned()
-            .collect()
+            .collect();
+        handles.iter().map(|chunk| (**chunk).clone()).collect()
+    }
+
+    /// Bounded IPC projection: count all matching retained chunks, but copy
+    /// only the newest complete chunks that fit each direction's budget.
+    /// Payload copying occurs after releasing the capture-store lock.
+    pub fn bounded_snapshot(
+        &self,
+        conn_id: &str,
+        direction: Option<Direction>,
+        max_chunks: usize,
+        max_bytes: usize,
+    ) -> (Vec<TrafficChunk>, u64) {
+        let mut total = 0;
+        let mut counts = [0usize; 2];
+        let mut bytes = [0usize; 2];
+        let mut handles = Vec::new();
+        {
+            let store = self.read_chunks();
+            for chunk in store.chunks.iter().rev() {
+                if chunk.conn_id != conn_id || direction.is_some_and(|dir| dir != chunk.direction) {
+                    continue;
+                }
+                total += 1;
+                let slot = usize::from(chunk.direction == Direction::ServerToClient);
+                if counts[slot] < max_chunks && chunk.len() <= max_bytes.saturating_sub(bytes[slot])
+                {
+                    handles.push(Arc::clone(chunk));
+                    counts[slot] += 1;
+                    bytes[slot] += chunk.len();
+                }
+            }
+        }
+        let chunks = handles
+            .into_iter()
+            .rev()
+            .map(|chunk| (*chunk).clone())
+            .collect();
+        (chunks, total)
     }
 
     /// Retained chunk payload bytes (for bound assertions in tests).
@@ -539,6 +601,21 @@ impl MemoryHistory {
     /// Event timestamps travel with the op and are independent of delays.
     fn apply_op(conns: &mut VecDeque<ConnectionRecord>, limits: &HistoryLimits, op: ConnOp) {
         match op {
+            ConnOp::Rejected { rejected, at } => {
+                conns.push_back(ConnectionRecord {
+                    conn_id: rejected.conn_id,
+                    requested_target: rejected.requested_target,
+                    requested_port: rejected.requested_port,
+                    resolved_upstream: None,
+                    opened_wall: None,
+                    opened_mono: None,
+                    closed_wall: Some(at.wall),
+                    closed_mono: Some(at.mono),
+                    close_reason: Some(rejected.reason),
+                    bytes_client_to_server: 0,
+                    bytes_server_to_client: 0,
+                });
+            }
             ConnOp::Open { open, at } => {
                 conns.push_back(ConnectionRecord {
                     conn_id: open.conn_id,
@@ -598,6 +675,12 @@ impl MemoryHistory {
 }
 
 impl HistorySink for MemoryHistory {
+    fn record_connection_rejected(&self, rejected: ConnectionRejected) {
+        self.record_op(ConnOp::Rejected {
+            rejected,
+            at: RecordTime::now(),
+        });
+    }
     fn record_connection_open(&self, open: ConnectionOpen) {
         self.record_op(ConnOp::Open {
             open,
@@ -623,7 +706,7 @@ impl HistorySink for MemoryHistory {
             }
         };
         chunks.bytes_retained += chunk.len() as u64;
-        chunks.chunks.push_back(chunk);
+        chunks.chunks.push_back(Arc::new(chunk));
         while chunks.chunks.len() > self.limits.max_events
             || chunks.bytes_retained > self.limits.max_bytes
         {

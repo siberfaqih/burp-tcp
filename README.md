@@ -59,7 +59,7 @@ cargo test --workspace --locked   # engine + fixtures (fmt/clippy clean, warning
 cargo build --release --locked    # -> target/release/rawtcp-engine
 
 cd extension
-mvn clean verify                  # -> target/rawtcp-burp-extension-0.1.2.jar
+mvn clean verify                  # -> target/rawtcp-burp-extension-0.1.3.jar
 ```
 
 Windows binaries are built natively by CI (`.github/workflows/build-windows.yml`).
@@ -78,33 +78,54 @@ application through `127.0.0.1:1080` as its SOCKS5 proxy.
 ## Scope and limits (read before pentesting bulk transfers)
 
 - Loopback only. No TLS interception, no UDP, no message reassembly:
-  interception holds TCP *chunks*, not application messages. A large download
-  is thousands of units — the 128-slot queue saturates and the rest bypasses
-  intercept untouched. Keep `Intercept to client` off during bulk transfers,
-  intercept requests only, and use Forward-all to release a backed-up queue.
+  interception holds TCP *chunks*, not application messages. Each connection
+  holds at most one chunk per direction; download size alone does not fill
+  the 128-slot queue. Many concurrent streams can exhaust it. Use Forward all
+  to release held units unchanged, or disable an unneeded direction.
 - Never Drop/Close a `stream slice #N > 1` unless breaking that transfer is
   the intent; a truncated stream surfaces in the app as a cut connection or
   a half-parsed document.
-- Holding a heartbeat longer than the application's heartbeat interval logs
-  the session out. That is inherent to manual interception, not a proxy bug.
+- Holding traffic can exceed application-specific timeouts, including
+  heartbeat deadlines. The resulting behavior depends on the protocol.
 - Diagnose from the Intercept stats line: rising `Bypassed (queue full)` =
   saturated queue; rising `Expired` = units auto-released after the 30 s
   lease because nobody decided in time.
 - The banner under the connect bar always shows engine epoch, the
   `app proxy →` address the target must use, live policy, and live/held
-  counts. If traffic bypasses intercept, read it first: red `NOT CONNECTED`
-  means the socket is dead (stale token after an engine restart is the usual
-  cause — the engine names it explicitly, paste the fresh token and press the
-  button once); policy `off` means fail-open or an unticked box, not a bug.
+  counts plus cumulative admitted SOCKS sockets (`accepted`). Red
+  `NOT CONNECTED` shows the last disconnect reason. The engine reports bad
+  tokens explicitly; after restarting it, paste the new token. Last-controller
+  loss disables interception: check and re-enable the desired directions after
+  reconnecting.
 - The Connections **Ended** column shows why each closed session ended.
-  History fetches at most 300 newest chunks per connection per direction
-  ("newest K of N") so bulk transfers cannot wedge the control plane.
+  Failed SOCKS CONNECT attempts are retained here too, with no fabricated
+  payload. History visits all connections with two outstanding queries at
+  most, bounded to 300 chunks / 1 MiB per direction per response. The UI cache
+  retains up to 8192 chunks / 16 MiB; `newest K of N` reports truncation.
 - One engine at a time: a second `rawtcp-engine.exe` cannot bind the same
   ports and exits. If Burp was killed instead of unloaded, the engine reaps
   the half-open controller after 60 s idle and frees its slot.
 
+## Troubleshooting missing traffic
+
+- `SOCKS5 CONNECT ... 0x05 (connection refused)` means the proxy received the
+  request, but the OS refused the upstream TCP connection. Check **Connections
+  → Ended**. No application traffic exists to intercept or capture until
+  CONNECT succeeds. From the engine machine, test with
+  `Test-NetConnection <host> -Port <port>` on Windows.
+- Exclude `rawtcp-engine.exe` from ProxyBridge proxy rules to avoid routing
+  the engine's upstream sockets back into itself. Route the target process
+  through the SOCKS address shown in the banner.
+- An unanswered IPC RPC times out after 15 seconds and triggers reconnect.
+  Decisions and Repeater sends are never automatically replayed; their outcome
+  may be unknown. Recheck the directional policy after reconnecting.
+- Capture is bounded and lossy under pressure. **History drops** counts lock
+  contention losses; FIFO eviction and snapshot limits also remove older
+  chunks from view. Live byte counters track forwarding independently of
+  capture retention.
+
 ## Releases
 
 Versioned Windows assets (`rawtcp-engine.exe`,
-`rawtcp-burp-extension-0.1.2.jar`, `SHA256SUMS.txt`) are attached to GitHub
+`rawtcp-burp-extension-0.1.3.jar`, `SHA256SUMS.txt`) are attached to GitHub
 Releases, built by CI on `windows-latest`.

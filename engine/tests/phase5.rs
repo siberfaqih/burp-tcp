@@ -392,6 +392,10 @@ async fn probe_server() -> ProbeServer {
             match tokio::time::timeout(Duration::from_secs(5), writer.write_all(&chunk)).await {
                 Ok(Ok(())) => {
                     total += chunk.len() as u64;
+                    // Allow the kernel to deliver the RST before trying the
+                    // next write. Sixteen immediately-ready writes can all
+                    // enter the send buffer before the first RST is processed.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                     if total >= 1024 {
                         break ProbeOutcome::PeerAlive;
                     }
@@ -410,6 +414,26 @@ async fn probe_server() -> ProbeServer {
         outcome_rx,
         join,
     }
+}
+
+/// Calibrate the teardown probe against a genuinely live, half-closed peer.
+/// The probe must not confuse request EOF with a fully closed socket.
+#[tokio::test]
+async fn teardown_probe_distinguishes_live_half_closed_peer() {
+    let mut server = probe_server().await;
+    let mut client = TcpStream::connect(server.addr).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    client.shutdown().await.unwrap();
+    server.probe_tx.send(()).await.unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), server.outcome_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, ProbeOutcome::PeerAlive);
+    let mut received = vec![0; 1024];
+    client.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, vec![0x5a; 1024]);
+    server.join.await.unwrap();
 }
 
 /// Fixture that accepts connections and drops each one immediately without

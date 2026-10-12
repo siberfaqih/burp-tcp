@@ -87,7 +87,8 @@ message ListConnections {}
 message HistorySnapshot {
   string conn_id = 1;
   Direction direction = 2;       // UNSPECIFIED = both directions
-  uint32 max_chunks = 3;         // 0 = all; otherwise newest N chunks only
+  uint32 max_chunks = 3;         // per direction; 0 = server default (300)
+                                // server caps at 300 chunks / 1 MiB per direction
 }
 
 message PendingUnits {}
@@ -229,6 +230,10 @@ message Stats {
   bool c2s_enabled = 7;
   bool s2c_enabled = 8;
   uint64 ipc_dropped_events = 9;
+  uint64 history_dropped_chunks = 10; // contention losses, excludes FIFO eviction
+  uint64 history_dropped_bytes = 11;
+  uint64 accepted_connections = 12;  // admitted SOCKS sockets since startup
+  uint64 active_connections = 13;    // includes negotiating sockets
 }
 
 // --- Envelopes ---

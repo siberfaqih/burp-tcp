@@ -70,12 +70,14 @@ public final class IpcClient implements IpcSession {
     private static final long HANDSHAKE_DEADLINE_SECONDS = 15L;
     private static final long RECONNECT_DELAY_MS = 3000L;
     private static final long SEND_TIMEOUT_MS = 10_000L;
+    private static final long REQUEST_TIMEOUT_MS = 15_000L;
     private static final int MAX_PENDING = 256;
 
     private final String clientName;
     private final String clientVersion;
     private final long handshakeDeadlineSeconds;
     private final long sendTimeoutMs;
+    private final long requestTimeoutMs;
     private final List<IpcListener> listeners = new CopyOnWriteArrayList<>();
     private final HttpClient http =
             HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build();
@@ -124,10 +126,16 @@ public final class IpcClient implements IpcSession {
     /** Test seam: override the handshake deadline and the send timeout. */
     IpcClient(String clientName, String clientVersion,
             long handshakeDeadlineSeconds, long sendTimeoutMs) {
+        this(clientName, clientVersion, handshakeDeadlineSeconds, sendTimeoutMs, REQUEST_TIMEOUT_MS);
+    }
+
+    IpcClient(String clientName, String clientVersion,
+            long handshakeDeadlineSeconds, long sendTimeoutMs, long requestTimeoutMs) {
         this.clientName = clientName;
         this.clientVersion = clientVersion;
         this.handshakeDeadlineSeconds = handshakeDeadlineSeconds;
         this.sendTimeoutMs = sendTimeoutMs;
+        this.requestTimeoutMs = requestTimeoutMs;
     }
 
     @Override
@@ -363,6 +371,23 @@ public final class IpcClient implements IpcSession {
             return future;
         }
         conn.pending.put(id, future);
+        // A successful WebSocket send only means the bytes were queued. A
+        // peer can stop answering without closing TCP; invalidate that socket
+        // so pending UI refreshes complete and the reconnect loop can recover.
+        // Never replay the timed-out RPC (a decision/send may have executed).
+        future.orTimeout(requestTimeoutMs, TimeUnit.MILLISECONDS)
+                .whenComplete((response, error) -> {
+                    if (error instanceof java.util.concurrent.TimeoutException) {
+                        removePending(conn, id);
+                        handleClosed(conn, "response timeout: " + requestBuilder.getBodyCase()
+                                + " (outcome unknown; request not retried)");
+                    }
+                });
+        if (conn.closedOnce.get()) {
+            removePending(conn, id);
+            future.completeExceptionally(new IOException("not connected"));
+            return future;
+        }
         try {
             enqueueSend(conn, id, bytes, future);
         } catch (RejectedExecutionException rejected) {

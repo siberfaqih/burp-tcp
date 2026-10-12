@@ -424,13 +424,16 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<IpcState>) 
                 request_id,
                 body: Some(proto::ResponseBody::Error(proto::Error {
                     code: 4401,
-                    message: "bad capability token: the engine restarted; paste the token it just printed"
+                    message: "bad capability token: paste the token printed by the running engine"
                         .into(),
                 })),
             })),
         };
-        let _ = ws.send(WsMessage::Binary(encode(&error))).await;
-        let _ = ws.send(WsMessage::Close(None)).await;
+        let _ = tokio::time::timeout(IPC_SEND_TIMEOUT, async {
+            ws.send(WsMessage::Binary(encode(&error))).await?;
+            ws.send(WsMessage::Close(None)).await
+        })
+        .await;
         return Err(());
     }
     if hello.protocol_version != PROTOCOL_VERSION {
@@ -446,7 +449,8 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<IpcState>) 
                 })),
             })),
         };
-        let _ = ws.send(WsMessage::Binary(encode(&error))).await;
+        let _ = tokio::time::timeout(IPC_SEND_TIMEOUT, ws.send(WsMessage::Binary(encode(&error))))
+            .await;
         return Err(());
     }
 
@@ -463,7 +467,10 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<IpcState>) 
             })),
         })),
     };
-    if ws.send(WsMessage::Binary(encode(&ack))).await.is_err() {
+    if !matches!(
+        tokio::time::timeout(IPC_SEND_TIMEOUT, ws.send(WsMessage::Binary(encode(&ack)))).await,
+        Ok(Ok(()))
+    ) {
         return Err(());
     }
 
@@ -489,6 +496,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<IpcState>) 
 
     // Split the WebSocket for concurrent read + write.
     let (mut sink, mut stream) = ws.split();
+    let mut idle_deadline = tokio::time::Instant::now() + IPC_IDLE_TIMEOUT;
 
     loop {
         // Poll an in-flight repeater operation once per iteration so
@@ -507,16 +515,10 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<IpcState>) 
         let repeater_pending = repeater_active.is_some();
         tokio::select! {
             biased;
-            // Client request. The read carries the idle deadline: a live
-            // control plane polls every few hundred milliseconds, so a
-            // quieter socket is a dead peer. Reaping it frees its handler
-            // slot and runs last-controller fail-open instead of wedging
-            // IPC until an engine restart.
-            frame = async {
-                tokio::time::timeout(IPC_IDLE_TIMEOUT, stream.next())
-                    .await
-                    .unwrap_or_default()
-            } => {
+            // Outgoing events and poll ticks must not extend client liveness.
+            _ = tokio::time::sleep_until(idle_deadline) => break,
+            frame = stream.next() => {
+                idle_deadline = tokio::time::Instant::now() + IPC_IDLE_TIMEOUT;
                 let bytes = match frame {
                     Some(Ok(WsMessage::Binary(b))) => b,
                     Some(Ok(WsMessage::Close(_))) | None => break,
@@ -801,18 +803,8 @@ fn list_connections(state: &IpcState) -> proto::ConnectionList {
     for conn in &active {
         let established = matches!(conn.state, crate::connection::ConnectionState::Forwarding);
         let closed = matches!(conn.state, crate::connection::ConnectionState::Closed);
-        let bytes_c2s: u64 = state
-            .history
-            .chunks_for_direction(&conn.id, Direction::ClientToServer)
-            .iter()
-            .map(|c| c.bytes.len() as u64)
-            .sum();
-        let bytes_s2c: u64 = state
-            .history
-            .chunks_for_direction(&conn.id, Direction::ServerToClient)
-            .iter()
-            .map(|c| c.bytes.len() as u64)
-            .sum();
+        let bytes_c2s = conn.bytes_c2s.load(Ordering::Relaxed);
+        let bytes_s2c = conn.bytes_s2c.load(Ordering::Relaxed);
         info.push(proto::ConnectionInfo {
             conn_id: conn.id.clone(),
             requested_host: conn.requested_target.clone().unwrap_or_default(),
@@ -848,35 +840,18 @@ fn list_connections(state: &IpcState) -> proto::ConnectionList {
 }
 
 fn history_snapshot(state: &IpcState, hs: &proto::HistorySnapshot) -> proto::HistoryData {
-    // Newest-first truncation per direction bounds snapshot cost so a bulk
-    // transfer cannot wedge the control plane behind a tens-of-megabytes
-    // response — while keeping the quiet direction visible. Chunks carry
-    // per-direction seq; the UI re-sorts by recorded time.
-    let cap = hs.max_chunks as usize;
-    let mut total_chunks = 0u64;
-    let mut newest = |mut vec: Vec<crate::history::TrafficChunk>| {
-        total_chunks += vec.len() as u64;
-        if cap > 0 && vec.len() > cap {
-            vec.drain(..vec.len() - cap);
-        }
-        vec
+    // Enforce both count and byte limits even for older clients sending zero.
+    let cap = if hs.max_chunks == 0 {
+        300
+    } else {
+        hs.max_chunks.min(300)
     };
-    let chunks = match proto_direction_to_engine(hs.direction) {
-        Some(dir) => newest(state.history.chunks_for_direction(&hs.conn_id, dir)),
-        None => {
-            let mut all = newest(
-                state
-                    .history
-                    .chunks_for_direction(&hs.conn_id, Direction::ClientToServer),
-            );
-            all.extend(newest(
-                state
-                    .history
-                    .chunks_for_direction(&hs.conn_id, Direction::ServerToClient),
-            ));
-            all
-        }
-    };
+    let (chunks, total_chunks) = state.history.bounded_snapshot(
+        &hs.conn_id,
+        proto_direction_to_engine(hs.direction),
+        cap as usize,
+        1024 * 1024,
+    );
     let chunk_infos = chunks
         .iter()
         .map(|c| proto::TrafficChunkInfo {
@@ -981,6 +956,10 @@ fn stats_snapshot(state: &IpcState) -> proto::Stats {
         c2s_enabled: state.intercept.enabled(Direction::ClientToServer),
         s2c_enabled: state.intercept.enabled(Direction::ServerToClient),
         ipc_dropped_events: state.ipc_dropped_events.load(Ordering::Relaxed),
+        history_dropped_chunks: state.history.dropped_chunks(),
+        history_dropped_bytes: state.history.dropped_bytes(),
+        accepted_connections: state.registry.accepted(),
+        active_connections: state.registry.active() as u64,
     }
 }
 

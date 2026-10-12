@@ -24,7 +24,7 @@ cd extension
 mvn clean verify          # compiles proto, runs tests, produces the jar
 ```
 
-Output: `target/rawtcp-burp-extension-0.1.2.jar` — a single shaded jar with
+Output: `target/rawtcp-burp-extension-0.1.3.jar` — a single shaded jar with
 `protobuf-java` bundled and the Montoya API excluded (Burp supplies it).
 
 The canonical schema `../proto/burp_tcp.proto` is compiled by `protoc`
@@ -56,17 +56,17 @@ are remembered in Burp preferences between sessions. A stale token reports
 engine window and press the button once to reconnect; no extension re-import
 or full re-setup is needed. The banner under the connect bar always shows the
 truth: engine epoch, the `app proxy →` address the target must point at,
-live intercept policy, and live/held counts. Red `NOT CONNECTED` means the
+live intercept policy, admitted SOCKS connections since startup, and live/held counts. Red `NOT CONNECTED` means the
 socket is dead — check the engine window, port, and token.
 
 ## Tabs
 
-- **Connections** — live sessions from `ListConnections`. Selecting a row
+- **Connections** — active sessions and retained closed/failed attempts from `ListConnections`. Selecting a row
   drives the History tab. The **Ended** column shows the engine's terminal
   reason for closed sessions (`eof`, `closed by interception decision`,
-  transport errors) — a `0 / 0`-byte closed row with a reason names the
+  transport errors, or `SOCKS CONNECT failed (0x05)`) — a `0 / 0`-byte closed row with a reason names the
   failure instead of leaving a mystery drop.
-- **TCP history** — one passive log of every forwarded chunk across all
+- **TCP history** — a bounded passive log of captured forwarded chunks across all
   connections, newest last, like Burp's HTTP history. Nothing needs selecting
   first: traffic appears on its own while Live is on. The connection dropdown
   is only a filter (default All connections); picking a Connections row
@@ -74,8 +74,11 @@ socket is dead — check the engine window, port, and token.
   Direction filter, literal text/hex search, and numeric sorting apply locally
   without new fetches. Right-click a row → **Send to Repeater**,
   **Send to Decoder**, or **Copy bytes as hex**. Selection survives refresh;
-  with nothing selected the newest chunk is shown. Each cycle re-reads only
-  connections whose byte counters moved, so a quiet tab costs almost no RPC.
+  with nothing selected the newest chunk is shown. A FIFO scheduler queries all
+  connections with at most two outstanding history RPCs. Refreshes coalesce;
+  slow responses remain valid. Changed counters trigger fetching immediately,
+  and live sessions are revisited every five seconds. The UI cache retains up
+  to 8192 chunks / 16 MiB of payload, evicting oldest chunks first.
 - **Intercept** — directional enable toggles, queue count, and an inline
   hex/text editor. **Forward** sends the original bytes or commits a
   replacement when edited, then selects the next held unit. **Forward all**
@@ -105,13 +108,12 @@ socket is dead — check the engine window, port, and token.
 
 ### Bulk transfers, downloads, and heartbeats
 
-Each held unit is one ~16 KiB TCP read, not one message. A 50 MB download is
-thousands of units: the 128-slot engine queue fills instantly and the rest
-bypasses intercept untouched (watch `Bypassed (queue full)` in the stats
-line). The few units you do see are random mid-stream slices — editing,
-dropping, or closing them corrupts the transfer while the app times out
-waiting. Heartbeats are worse: holding one longer than the app's heartbeat
-interval logs you out by design.
+Each held unit is one TCP read (up to 16 KiB by default), not one message.
+Each connection/direction holds at most one unit and waits for its resolution
+before reading more. Download size alone does not fill the 128-slot queue;
+many concurrent streams can. `Bypassed (queue full)` counts that condition.
+Holding traffic can exceed application-specific timeouts, including heartbeat
+deadlines. Whether the application disconnects depends on its protocol.
 
 Playbook: keep `Intercept to client` OFF during bulk downloads and let
 responses flow; intercept `to server` (requests) only. When the queue backs
@@ -120,6 +122,30 @@ Never Drop/Close a `stream slice #N>1` unless breaking that transfer is the
 point. If connections run past intercept while both toggles are on, check
 `Bypassed (queue full)` (queue saturated) and `Expired` (units auto-released
 after the 30 s lease because nobody decided in time).
+
+### Missing traffic and recovery
+
+`SOCKS5 CONNECT ... 0x05 (connection refused)` means the proxy received the
+request, but the OS refused the upstream TCP connection. No application bytes
+were forwarded: inspect **Connections → Ended** for the requested destination
+and error. Failed attempts are retained as metadata, not fabricated chunks.
+Check target availability from the engine machine (Windows:
+`Test-NetConnection <host> -Port <port>`). In a process-routing tool such as
+ProxyBridge, exclude `rawtcp-engine.exe` from proxy routing to avoid recursion.
+
+`accepted` in the banner counts admitted SOCKS sockets since startup;
+`live` counts currently active sockets, including negotiation. These help
+distinguish an absent route from a failed upstream connect. Reused connections
+do not increase `accepted`. **History drops** counts capture lost to lock
+contention; history retention and snapshot limits can also omit older chunks.
+
+An unanswered RPC expires after 15 seconds and closes its control socket so
+the extension can reconnect. Timed-out decisions and Repeater sends are never
+automatically replayed: their outcome may be unknown. Last-controller loss
+disables interception and releases held units; after reconnect, check and
+re-enable the desired directions. The engine closes authenticated IPC sockets
+after 60 seconds without incoming client activity; outgoing polls/events do
+not reset that deadline.
   The selected UTF-8/Hex view persists through queue changes, Forward, and
   restoring a draft. Binary that cannot decode as UTF-8 remains a read-only
   text preview in UTF-8 mode; Forward still uses the original bytes.
@@ -187,8 +213,9 @@ application messages:
 importing one chunk does not reconstruct a full protocol conversation. Repeater
 opens a fresh connection, so it does not inherit authentication or session state.
 An evicted/unknown destination leaves the draft target empty for manual entry.
-Each history fetch pulls at most 300 newest chunks per connection per
-direction; the status line reports the retained total ("newest K of N").
+Each history fetch returns at most 300 complete chunks / 1 MiB per connection
+per direction; the status line reports the retained total ("newest K of N").
+These engine-side limits also apply to older clients requesting all chunks.
 
 ## Wire protocol
 

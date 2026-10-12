@@ -46,6 +46,59 @@ class IpcClientTest {
     }
 
     @Test
+    void unansweredRpcClosesSocketAndRecoversWithoutRestart() throws Exception {
+        AtomicInteger accepts = new AtomicInteger();
+        CountDownLatch firstConnected = new CountDownLatch(1);
+        CountDownLatch reconnected = new CountDownLatch(1);
+        CountDownLatch disconnected = new CountDownLatch(1);
+        CountDownLatch oldSocketClosed = new CountDownLatch(1);
+        AtomicReference<String> reason = new AtomicReference<>();
+        IpcClient client = new IpcClient("test", "1", 5, 1000, 500);
+        try (TestWebSocketServer server = new TestWebSocketServer(session -> {
+            int attempt = accepts.incrementAndGet();
+            try {
+                var hello = BurpTcp.ClientMessage.parseFrom(session.readBinary()).getRequest();
+                session.sendBinary(helloAck(hello.getRequestId()));
+                byte[] frame;
+                while ((frame = session.readBinary()) != null) {
+                    var request = BurpTcp.ClientMessage.parseFrom(frame).getRequest();
+                    // First socket accepts requests but deliberately never answers.
+                    if (attempt > 1) session.sendBinary(stats(request.getRequestId(), 42));
+                }
+            } catch (IOException ignored) {
+                // abort() may produce FIN or RST.
+            } finally {
+                if (attempt == 1) oldSocketClosed.countDown();
+            }
+        })) {
+            client.addListener(new IpcListener() {
+                @Override public void onConnected(BurpTcp.HelloAck ack) {
+                    if (firstConnected.getCount() > 0) firstConnected.countDown();
+                    else reconnected.countDown();
+                }
+                @Override public void onDisconnected(String value) {
+                    reason.set(value);
+                    disconnected.countDown();
+                }
+                @Override public void onEvent(BurpTcp.Event event) { }
+            });
+            client.start("127.0.0.1", server.port(), "token");
+            assertTrue(firstConnected.await(10, TimeUnit.SECONDS));
+            var pending = client.pendingUnits();
+            var policy = client.stats();
+            assertTrue(disconnected.await(10, TimeUnit.SECONDS));
+            assertTrue(pending.isCompletedExceptionally());
+            assertTrue(policy.isCompletedExceptionally());
+            assertTrue(reason.get().contains("response timeout"), reason.get());
+            assertTrue(oldSocketClosed.await(10, TimeUnit.SECONDS));
+            assertTrue(reconnected.await(10, TimeUnit.SECONDS));
+            assertEquals(42, client.stats().get(10, TimeUnit.SECONDS).getOffers());
+        } finally {
+            client.close();
+        }
+    }
+
+    @Test
     void handshakeSendsTokenAndDispatchesEvents() throws Exception {
         AtomicReference<String> seenToken = new AtomicReference<>();
         CountDownLatch connected = new CountDownLatch(1);

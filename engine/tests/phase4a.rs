@@ -92,6 +92,16 @@ async fn rpc(
     request_id: u32,
     body: RequestBody,
 ) -> proto::Response {
+    tokio::time::timeout(Duration::from_secs(10), rpc_inner(ws, request_id, body))
+        .await
+        .expect("IPC response deadline")
+}
+
+async fn rpc_inner(
+    ws: &mut WebSocketStream<TcpStream>,
+    request_id: u32,
+    body: RequestBody,
+) -> proto::Response {
     let msg = ClientMessage {
         request: Some(Request {
             request_id,
@@ -118,6 +128,344 @@ async fn rpc(
             other => panic!("unexpected server message: {other:?}"),
         }
     }
+}
+
+async fn wait_for_unit(
+    ws: &mut WebSocketStream<TcpStream>,
+    direction: i32,
+) -> proto::PendingUnitInfo {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = rpc(ws, 20, RequestBody::PendingUnits(PendingUnits {})).await;
+            if let Some(proto::ResponseBody::PendingList(list)) = response.body {
+                if let Some(unit) = list
+                    .units
+                    .into_iter()
+                    .find(|unit| unit.direction == direction)
+                {
+                    return unit;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("intercepted unit must become visible")
+}
+
+#[tokio::test]
+async fn repeated_direction_toggles_and_controller_reconnect_keep_same_tcp_session_usable() {
+    let harness = IpcHarness::start().await;
+    let echo = testlab::echo_server().await;
+    let mut ws = connect_and_handshake(harness.ipc_addr, &harness.token).await;
+    let mut stream = socks_client::connect_through_proxy(
+        harness.relay.local_addr(),
+        Destination::Ip(echo.addr().ip()),
+        echo.addr().port(),
+        GreetingStyle::Single,
+        RequestStyle::Single,
+    )
+    .await
+    .expect("SOCKS connect");
+
+    for round in 0..12u8 {
+        let direction = i32::from(round % 2) + 1;
+        rpc(
+            &mut ws,
+            2,
+            RequestBody::SetEnabled(SetEnabled {
+                direction,
+                enabled: true,
+            }),
+        )
+        .await;
+        let payload = [round, 0, 0xff, b'X'];
+        stream.write_all(&payload).await.unwrap();
+        let unit = wait_for_unit(&mut ws, direction).await;
+        assert_eq!(unit.bytes, payload);
+        let mut echoed = [0u8; 4];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stream.read_exact(&mut echoed))
+                .await
+                .is_err(),
+            "bytes must stay held until disable"
+        );
+        rpc(
+            &mut ws,
+            3,
+            RequestBody::SetEnabled(SetEnabled {
+                direction,
+                enabled: false,
+            }),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, payload);
+        // History queries share this same control channel throughout toggling.
+        let response = rpc(
+            &mut ws,
+            4,
+            RequestBody::HistorySnapshot(HistorySnapshot {
+                conn_id: unit.conn_id,
+                direction,
+                max_chunks: 1,
+            }),
+        )
+        .await;
+        match response.body {
+            Some(proto::ResponseBody::HistoryData(data)) => {
+                assert_eq!(data.chunks.last().unwrap().bytes, payload)
+            }
+            other => panic!("history response: {other:?}"),
+        }
+    }
+
+    rpc(
+        &mut ws,
+        5,
+        RequestBody::SetEnabled(SetEnabled {
+            direction: 1,
+            enabled: true,
+        }),
+    )
+    .await;
+    stream.write_all(b"held").await.unwrap();
+    wait_for_unit(&mut ws, 1).await;
+    drop(ws);
+    let mut echoed = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &echoed, b"held",
+        "controller loss must release pending bytes"
+    );
+    let mut ws = connect_and_handshake(harness.ipc_addr, &harness.token).await;
+    let response = rpc(&mut ws, 6, RequestBody::GetStats(GetStats {})).await;
+    match response.body {
+        Some(proto::ResponseBody::Stats(stats)) => {
+            assert!(!stats.c2s_enabled && !stats.s2c_enabled);
+            assert_eq!(stats.accepted_connections, 1);
+        }
+        other => panic!("stats response: {other:?}"),
+    }
+    rpc(
+        &mut ws,
+        7,
+        RequestBody::SetEnabled(SetEnabled {
+            direction: 1,
+            enabled: true,
+        }),
+    )
+    .await;
+    stream.write_all(b"back").await.unwrap();
+    let unit = wait_for_unit(&mut ws, 1).await;
+    assert_eq!(unit.bytes, b"back");
+    rpc(
+        &mut ws,
+        8,
+        RequestBody::Decide(Decide {
+            unit_id: unit.unit_id,
+            revision: unit.revision,
+            action: 1,
+            replace_bytes: Vec::new(),
+        }),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed, b"back");
+    harness.relay.shutdown().await;
+    echo.shutdown().await;
+}
+
+#[tokio::test]
+async fn live_counters_survive_history_eviction_and_snapshots_obey_byte_budget() {
+    let harness = IpcHarness::start().await;
+    let echo = testlab::echo_server().await;
+    let mut ws = connect_and_handshake(harness.ipc_addr, &harness.token).await;
+    let mut stream = socks_client::connect_through_proxy(
+        harness.relay.local_addr(),
+        Destination::Ip(echo.addr().ip()),
+        echo.addr().port(),
+        GreetingStyle::Single,
+        RequestStyle::Single,
+    )
+    .await
+    .unwrap();
+    let payload = vec![0xab; 32 * 1024];
+    let mut received = vec![0; payload.len()];
+    for _ in 0..160 {
+        stream.write_all(&payload).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, payload);
+    }
+    // >8 MiB total history forces FIFO eviction; transport counters stay exact.
+    let response = rpc(&mut ws, 2, RequestBody::ListConnections(ListConnections {})).await;
+    let conn = match response.body {
+        Some(proto::ResponseBody::ConnectionList(list)) => list.connections[0].clone(),
+        other => panic!("connection response: {other:?}"),
+    };
+    assert_eq!(conn.bytes_client_to_server, 160 * 32 * 1024);
+    assert_eq!(conn.bytes_server_to_client, conn.bytes_client_to_server);
+    for max_chunks in [0, u32::MAX] {
+        let response = rpc(
+            &mut ws,
+            3,
+            RequestBody::HistorySnapshot(HistorySnapshot {
+                conn_id: conn.conn_id.clone(),
+                direction: 0,
+                max_chunks,
+            }),
+        )
+        .await;
+        match response.body {
+            Some(proto::ResponseBody::HistoryData(data)) => {
+                assert!(data.total_chunks > data.chunks.len() as u64);
+                for direction in [1, 2] {
+                    let chunks: Vec<_> = data
+                        .chunks
+                        .iter()
+                        .filter(|c| c.direction == direction)
+                        .collect();
+                    assert!(!chunks.is_empty());
+                    assert!(chunks.len() <= 300);
+                    assert!(chunks.iter().map(|c| c.bytes.len()).sum::<usize>() <= 1024 * 1024);
+                }
+            }
+            other => panic!("history response: {other:?}"),
+        }
+        // Control RPC remains usable after a full-size history response.
+        rpc(
+            &mut ws,
+            4,
+            RequestBody::SetEnabled(SetEnabled {
+                direction: 1,
+                enabled: true,
+            }),
+        )
+        .await;
+        stream.write_all(b"next").await.unwrap();
+        wait_for_unit(&mut ws, 1).await;
+        rpc(
+            &mut ws,
+            5,
+            RequestBody::SetEnabled(SetEnabled {
+                direction: 1,
+                enabled: false,
+            }),
+        )
+        .await;
+        let mut small = [0; 4];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut small))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&small, b"next");
+    }
+    harness.relay.shutdown().await;
+    echo.shutdown().await;
+}
+
+#[tokio::test]
+async fn refused_connect_remains_visible_without_fabricated_traffic() {
+    let harness = IpcHarness::start().await;
+    let refused = testlab::refused_endpoint().await;
+    let mut ws = connect_and_handshake(harness.ipc_addr, &harness.token).await;
+    let mut stream = socks_client::open(harness.relay.local_addr())
+        .await
+        .unwrap();
+    socks_client::greeting(&mut stream, GreetingStyle::Single, &[0])
+        .await
+        .unwrap();
+    socks_client::send_request(
+        &mut stream,
+        &Destination::Ip(refused.ip()),
+        refused.port(),
+        RequestStyle::Single,
+    )
+    .await
+    .unwrap();
+    let reply = socks_client::read_reply(&mut stream).await.unwrap();
+    assert_eq!(reply.code, 0x05);
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = rpc(&mut ws, 2, RequestBody::ListConnections(ListConnections {})).await;
+            if let Some(proto::ResponseBody::ConnectionList(list)) = response.body {
+                if let Some(conn) = list.connections.into_iter().find(|c| c.closed) {
+                    break conn;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("failed CONNECT must remain in Connections");
+    assert_eq!(closed.requested_host, refused.ip().to_string());
+    assert_eq!(closed.requested_port, u32::from(refused.port()));
+    assert!(
+        closed.close_reason.contains("0x05"),
+        "{}",
+        closed.close_reason
+    );
+    assert_eq!(closed.bytes_client_to_server, 0);
+    assert_eq!(closed.bytes_server_to_client, 0);
+    let response = rpc(
+        &mut ws,
+        3,
+        RequestBody::HistorySnapshot(HistorySnapshot {
+            conn_id: closed.conn_id,
+            direction: 0,
+            max_chunks: 1,
+        }),
+    )
+    .await;
+    match response.body {
+        Some(proto::ResponseBody::HistoryData(data)) => assert!(data.chunks.is_empty()),
+        other => panic!("history response: {other:?}"),
+    }
+    harness.relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn idle_controller_expires_despite_periodic_server_polling() {
+    let harness = IpcHarness::start().await;
+    let mut ws = connect_and_handshake(harness.ipc_addr, &harness.token).await;
+    rpc(
+        &mut ws,
+        2,
+        RequestBody::SetEnabled(SetEnabled {
+            direction: 1,
+            enabled: true,
+        }),
+    )
+    .await;
+    // Keep TCP open and read outbound events, but send no further activity.
+    tokio::time::timeout(Duration::from_secs(65), async {
+        while let Some(Ok(frame)) = ws.next().await {
+            if matches!(frame, WsMessage::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("100ms poll ticks must not reset the 60s idle deadline");
+    assert!(!harness
+        .relay
+        .intercept()
+        .enabled(rawtcp_engine::Direction::ClientToServer));
+    let mut recovered = connect_and_handshake(harness.ipc_addr, &harness.token).await;
+    rpc(&mut recovered, 3, RequestBody::GetStats(GetStats {})).await;
+    harness.relay.shutdown().await;
 }
 
 /// Helper: relay + IPC handles.

@@ -90,6 +90,7 @@ public final class InterceptPanel extends JPanel {
     private long pendingSeq;
     private long statsSeq;
     private boolean statsLoading;
+    private BurpTcp.Stats latestStats = BurpTcp.Stats.getDefaultInstance();
     private java.util.function.Consumer<String> notifier = notice::setText;
 
     public InterceptPanel(ControlPlane client) {
@@ -184,6 +185,7 @@ public final class InterceptPanel extends JPanel {
         c2s.setEnabled(connected);
         s2c.setEnabled(connected);
         if (!connected) {
+            latestStats = BurpTcp.Stats.getDefaultInstance();
             pendingSeq++;
             statsSeq++;
             statsLoading = false;
@@ -384,14 +386,17 @@ public final class InterceptPanel extends JPanel {
     }
 
     private void applyStats(BurpTcp.Stats value) {
+        latestStats = value;
         applyEnabledState(value.getC2SEnabled(), value.getS2CEnabled());
         stats.setText(String.format(
-                "Held total: %d · Decisions: %d · Bypassed (queue full): %d · Expired: %d · Released on disable: %d · Abandoned: %d · Event drops: %d",
+                "Held total: %d · Decisions: %d · Bypassed (queue full): %d · Expired: %d · Released on disable: %d · Abandoned: %d · Event drops: %d · History drops: %d chunks / %d bytes",
                 value.getOffers(), value.getCommits(), value.getOverflowForwards(),
                 value.getLeaseReleases(),
                 value.getDisableReleases(), value.getAbandoned(),
-                value.getIpcDroppedEvents()));
+                value.getIpcDroppedEvents(), value.getHistoryDroppedChunks(), value.getHistoryDroppedBytes()));
     }
+
+    BurpTcp.Stats latestStats() { return latestStats; }
 
     /** Stats line text, for tests. */
     String statsText() {

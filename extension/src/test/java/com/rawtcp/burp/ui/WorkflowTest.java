@@ -145,9 +145,9 @@ class WorkflowTest {
             ref.get().setConnections(List.of(conn));
             ref.get().setConnection("conn");
         });
-        // setConnections starts one fetch cycle; setConnection starts another.
-        // Complete the current one.
-        fake.historyCalls.get(1).complete(BurpTcp.HistoryData.newBuilder().addChunks(first).addChunks(second).build());
+        // Changing the filter must reuse the outstanding snapshot.
+        assertEquals(1, fake.historyCalls.size());
+        fake.historyCalls.get(0).complete(BurpTcp.HistoryData.newBuilder().addChunks(first).addChunks(second).build());
         flush();
         edt(() -> {
             ref.get().trafficTable().getRowSorter().toggleSortOrder(3);
@@ -157,7 +157,7 @@ class WorkflowTest {
             // More bytes arrive: counters move, so the live view refetches on its own.
             ref.get().setConnections(List.of(conn.toBuilder().setBytesClientToServer(5).build()));
         });
-        fake.historyCalls.get(2).complete(BurpTcp.HistoryData.newBuilder().addChunks(second).addChunks(first).build());
+        fake.historyCalls.get(1).complete(BurpTcp.HistoryData.newBuilder().addChunks(second).addChunks(first).build());
         flush();
         edt(() -> {
             ref.get().sendSelectedToRepeater();

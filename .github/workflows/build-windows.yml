@@ -70,27 +70,30 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
+          [xml]$pom = Get-Content "extension\pom.xml"
+          $version = $pom.project.version
+          $jar = "rawtcp-burp-extension-$version.jar"
 
           Copy-Item `
             "target\release\rawtcp-engine.exe" `
             "dist\rawtcp-engine.exe"
 
           Copy-Item `
-            "extension\target\rawtcp-burp-extension-0.1.2.jar" `
-            "dist\rawtcp-burp-extension-0.1.2.jar"
+            "extension\target\$jar" `
+            "dist\$jar"
 
           $engineHash = (Get-FileHash `
             "dist\rawtcp-engine.exe" `
             -Algorithm SHA256).Hash.ToLower()
 
           $extensionHash = (Get-FileHash `
-            "dist\rawtcp-burp-extension-0.1.2.jar" `
+            "dist\$jar" `
             -Algorithm SHA256).Hash.ToLower()
 
           "$engineHash  rawtcp-engine.exe" |
             Out-File -Encoding ascii dist\SHA256SUMS.txt
 
-          "$extensionHash  rawtcp-burp-extension-0.1.2.jar" |
+          "$extensionHash  $jar" |
             Out-File -Encoding ascii -Append dist\SHA256SUMS.txt
 
           Get-ChildItem dist

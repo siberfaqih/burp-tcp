@@ -177,7 +177,8 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
                 + (lastSocksAddr.isEmpty() ? "?" : lastSocksAddr)
                 + " · to server " + (policy[0] ? "ON" : "off")
                 + " · to client " + (policy[1] ? "ON" : "off")
-                + " · " + connectionsPanel().rowCount() + " live"
+                + " · " + intercept.latestStats().getActiveConnections() + " live"
+                + " · " + intercept.latestStats().getAcceptedConnections() + " accepted"
                 + " · " + lastQueueCount + " held");
         banner.setForeground(javax.swing.UIManager.getColor("Label.foreground"));
     }
@@ -235,6 +236,8 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
             connectButton.setText("Connect");
             status.setText("disconnected");
             onDisconnectedInternal();
+            lastDisconnectReason = "Disconnected by user";
+            updateBanner();
             return;
         }
 
@@ -270,7 +273,8 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
         // now stale.
         sessionEpoch++;
         started = true;
-        connectButton.setText("Disconnect");
+        lastDisconnectReason = "";
+        connectButton.setText("Reconnect");
         client.start("127.0.0.1", port, token);
     }
 
@@ -323,6 +327,7 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
 
     private void onDisconnectedInternal() {
         connected = false;
+        connectButton.setText(started ? "Reconnect" : "Connect");
         lastConnectionCount = -1;
         lastPendingCount = -1;
         lastEventSeq = 0;

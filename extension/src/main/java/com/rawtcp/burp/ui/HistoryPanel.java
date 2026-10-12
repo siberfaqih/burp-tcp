@@ -51,8 +51,10 @@ import java.awt.datatransfer.StringSelection;
  */
 public final class HistoryPanel extends JPanel {
 
-    /** Maximum connections fetched per refresh cycle (bounds snapshot RPCs). */
-    static final int MAX_FETCH_CONNECTIONS = 32;
+    /** Bound outstanding history RPCs, not the number of visible connections. */
+    static final int MAX_IN_FLIGHT = 2;
+    static final long MAX_CACHE_BYTES = 16 * 1024 * 1024;
+    static final int MAX_CACHE_CHUNKS = 8192;
     /**
      * Newest chunks requested per connection per direction. Bounds every
      * snapshot so one bulk transfer cannot wedge the control plane; the
@@ -84,16 +86,18 @@ public final class HistoryPanel extends JPanel {
     private java.util.function.Consumer<byte[]> decoder = bytes -> {};
     private java.util.function.Function<String, String> destination = Display::shortId;
     private boolean applying;
+    private String detailChunkId;
     /** Per-connection chunk cache plus the counters observed at the last fetch. */
     private final Map<String, ConnCache> caches = new LinkedHashMap<>();
     private List<BurpTcp.ConnectionInfo> latestConns = List.of();
     /** Null means no filter: show every connection. */
     private String filterConnId;
     private boolean syncingFilter;
-    /** Invalidates in-flight fetch cycles when a new one starts. */
+    /** Only a session reset invalidates responses; polling never does. */
     private long cycleSeq;
-    /** Fetches still outstanding in the current cycle. */
     private int cyclePending;
+    private final java.util.Set<String> queued = new java.util.LinkedHashSet<>();
+    private String lastFetchError = "";
 
     private record Row(String connId, BurpTcp.TrafficChunkInfo chunk) {}
     private static final class ConnCache {
@@ -102,6 +106,9 @@ public final class HistoryPanel extends JPanel {
         long fetchedS2c = -1;
         List<BurpTcp.TrafficChunkInfo> chunks = List.of();
         long totalChunks;
+        boolean loading;
+        boolean fetchedClosed;
+        long fetchedAtNanos;
     }
 
     public HistoryPanel(ControlPlane client) {
@@ -217,7 +224,6 @@ public final class HistoryPanel extends JPanel {
 
     /** Latest connection snapshot; drives fetching and the filter dropdown. */
     void setConnections(List<BurpTcp.ConnectionInfo> rows) {
-        if (connectionFilter.isPopupVisible()) return;
         latestConns = List.copyOf(rows);
         for (BurpTcp.ConnectionInfo info : rows) {
             caches.computeIfAbsent(info.getConnId(), id -> new ConnCache()).info = info;
@@ -227,8 +233,9 @@ public final class HistoryPanel extends JPanel {
         if (filterConnId != null && hadFilter && !caches.containsKey(filterConnId)) {
             filterConnId = null; // Follow live traffic instead of a vanished connection.
         }
-        rebuildFilter();
-        refilter();
+        if (!connectionFilter.isPopupVisible()) rebuildFilter();
+        queued.retainAll(caches.keySet());
+        applyMerged();
         if (live.isSelected()) refresh();
     }
 
@@ -236,60 +243,76 @@ public final class HistoryPanel extends JPanel {
     public void clear() {
         cycleSeq++;
         cyclePending = 0;
+        queued.clear();
+        lastFetchError = "";
         caches.clear();
         latestConns = List.of();
         filterConnId = null;
         rebuildFilter();
         model.set(List.of());
         detail.setBytes(new byte[0]);
+        detailChunkId = null;
         status.setText("Waiting for traffic. Enable Live or press Refresh.");
     }
 
     /** Fetch changed connections, then merge every cached chunk into one view. */
     public void refresh() {
-        long cycle = ++cycleSeq;
-        List<BurpTcp.ConnectionInfo> targets = pickTargets();
-        List<BurpTcp.ConnectionInfo> stale = targets.stream()
-                .filter(info -> {
-                    ConnCache cache = caches.computeIfAbsent(info.getConnId(), id -> new ConnCache());
-                    cache.info = info;
-                    return cache.fetchedC2s != info.getBytesClientToServer()
-                            || cache.fetchedS2c != info.getBytesServerToClient();
-                })
-                .toList();
-        if (stale.isEmpty()) {
-            applyMerged();
-            return;
+        // Keep FIFO work across refreshes. A busy early connection cannot
+        // continually jump ahead of a later or short-lived connection.
+        for (var entry : caches.entrySet()) {
+            ConnCache cache = entry.getValue();
+            if (!cache.loading && stale(cache)) queued.add(entry.getKey());
         }
-        cyclePending++;
-        int[] remaining = {stale.size()};
-        for (BurpTcp.ConnectionInfo info : stale) {
-            String id = info.getConnId();
+        drainFetches();
+    }
+
+    private boolean stale(ConnCache cache) {
+        return cache.fetchedC2s != cache.info.getBytesClientToServer()
+                || cache.fetchedS2c != cache.info.getBytesServerToClient()
+                || cache.fetchedClosed != cache.info.getClosed()
+                // Recording follows the transport counter increment. Revisit
+                // live sessions to catch a snapshot taken in that tiny gap.
+                || (!cache.info.getClosed() && System.nanoTime() - cache.fetchedAtNanos
+                        >= java.util.concurrent.TimeUnit.SECONDS.toNanos(5));
+    }
+
+    private void drainFetches() {
+        long cycle = cycleSeq;
+        while (cyclePending < MAX_IN_FLIGHT && !queued.isEmpty()) {
+            String id = queued.iterator().next();
+            queued.remove(id);
+            ConnCache cache = caches.get(id);
+            if (cache == null || cache.loading || !stale(cache)) continue;
+            BurpTcp.ConnectionInfo info = cache.info;
             long c2s = info.getBytesClientToServer();
             long s2c = info.getBytesServerToClient();
+            cache.loading = true;
+            cyclePending++;
             client.historySnapshot(id, BurpTcp.Direction.DIRECTION_UNSPECIFIED, HISTORY_MAX_CHUNKS)
                     .whenComplete((data, error) -> SwingUtilities.invokeLater(() -> {
                         if (cycle != cycleSeq) return;
-                        ConnCache cache = caches.get(id);
-                        if (cache != null && error == null) {
+                        cyclePending--;
+                        cache.loading = false;
+                        if (caches.get(id) == cache && error == null) {
                             cache.chunks = List.copyOf(data.getChunksList());
                             cache.totalChunks = data.getTotalChunks();
                             cache.fetchedC2s = c2s;
                             cache.fetchedS2c = s2c;
+                            cache.fetchedClosed = info.getClosed();
+                            cache.fetchedAtNanos = System.nanoTime();
+                            trimCache();
                         } else if (error != null) {
-                            status.setText("History refresh failed: " + error.getMessage());
+                            lastFetchError = error.getMessage();
                         }
-                        if (--remaining[0] == 0) {
-                            cyclePending--;
-                            if (cycle == cycleSeq) applyMerged();
-                        }
+                        applyMerged();
+                        drainFetches();
                     }));
         }
     }
 
-    /** Timer refreshes are coalesced; a slow fetch is never continually superseded. */
+    /** Enqueue new work without superseding or duplicating pending RPCs. */
     void refreshLive() {
-        if (live.isSelected() && cyclePending == 0) refresh();
+        if (live.isSelected()) refresh();
     }
 
     public void setRepeaterListener(BiConsumer<String, byte[]> listener) {
@@ -304,27 +327,21 @@ public final class HistoryPanel extends JPanel {
         if (row != null) repeater.accept(row.connId(), row.chunk().getBytes().toByteArray());
     }
 
-    /** Connections fetched this cycle: the filter target first, then snapshot order. */
-    private List<BurpTcp.ConnectionInfo> pickTargets() {
-        List<BurpTcp.ConnectionInfo> targets = new ArrayList<>();
-        if (filterConnId != null) {
-            ConnCache cached = caches.get(filterConnId);
-            if (cached != null && cached.info != null) targets.add(cached.info);
-            else {
-                for (BurpTcp.ConnectionInfo info : latestConns) {
-                    if (info.getConnId().equals(filterConnId)) {
-                        targets.add(info);
-                        break;
-                    }
-                }
-            }
-            return targets;
+    /** Bound payload and row retention even when many connections are active. */
+    private void trimCache() {
+        List<BurpTcp.TrafficChunkInfo> all = new ArrayList<>();
+        caches.values().forEach(cache -> all.addAll(cache.chunks));
+        all.sort(Comparator.comparingLong(BurpTcp.TrafficChunkInfo::getRecordedUnixMs).reversed());
+        var keep = new java.util.HashSet<String>();
+        long bytes = 0;
+        for (var chunk : all) {
+            if (keep.size() >= MAX_CACHE_CHUNKS || bytes + chunk.getBytes().size() > MAX_CACHE_BYTES) continue;
+            keep.add(chunk.getChunkId());
+            bytes += chunk.getBytes().size();
         }
-        for (BurpTcp.ConnectionInfo info : latestConns) {
-            if (targets.size() >= MAX_FETCH_CONNECTIONS) break;
-            targets.add(info);
+        for (ConnCache cache : caches.values()) {
+            cache.chunks = cache.chunks.stream().filter(chunk -> keep.contains(chunk.getChunkId())).toList();
         }
-        return targets;
     }
 
     private void applyMerged() {
@@ -372,9 +389,8 @@ public final class HistoryPanel extends JPanel {
         status.setText(table.getRowCount() + " / " + model.getRowCount()
                 + " chunks across " + conns + " connection(s)"
                 + (total > model.getRowCount() ? " · newest " + model.getRowCount() + " of " + total : "")
-                + (latestConns.size() > MAX_FETCH_CONNECTIONS && filterConnId == null
-                        ? " · showing first " + MAX_FETCH_CONNECTIONS : "")
-                + " · exact forwarded bytes");
+                + " · exact forwarded bytes"
+                + (lastFetchError.isEmpty() ? "" : " · last fetch error: " + lastFetchError));
     }
 
     private void refilter() {
@@ -384,10 +400,11 @@ public final class HistoryPanel extends JPanel {
         sorter.setRowFilter(new RowFilter<>() {
             @Override public boolean include(Entry<? extends Model, ? extends Integer> entry) {
                 Row row = model.get(entry.getIdentifier());
-                byte[] bytes = row.chunk().getBytes().toByteArray();
                 if (wanted != BurpTcp.Direction.DIRECTION_UNSPECIFIED
-                        && row.chunk().getDirection() != wanted) return false;
-                return query.isEmpty() || HexText.toPrintableText(bytes).toLowerCase(Locale.ROOT).contains(query)
+                         && row.chunk().getDirection() != wanted) return false;
+                if (query.isEmpty()) return true;
+                byte[] bytes = row.chunk().getBytes().toByteArray();
+                return HexText.toPrintableText(bytes).toLowerCase(Locale.ROOT).contains(query)
                         || HexText.toHex(bytes).contains(hex);
             }
         });
@@ -457,6 +474,9 @@ public final class HistoryPanel extends JPanel {
 
     private void showSelected() {
         Row row = selectedRow();
+        String id = row == null ? null : row.chunk().getChunkId();
+        if (java.util.Objects.equals(id, detailChunkId)) return;
+        detailChunkId = id;
         detail.setBytes(row == null ? new byte[0] : row.chunk().getBytes().toByteArray());
     }
 

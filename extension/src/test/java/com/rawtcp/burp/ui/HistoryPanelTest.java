@@ -82,24 +82,45 @@ class HistoryPanelTest {
     }
 
     @Test
-    void lateFetchCycleIsIgnored() throws Exception {
+    void slowFetchSurvivesRepeatedConnectionRefreshes() throws Exception {
         FakeControlPlane fake = new FakeControlPlane();
         AtomicReference<HistoryPanel> ref = new AtomicReference<>();
         onEdt(() -> ref.set(new HistoryPanel(fake)));
 
         onEdt(() -> ref.get().setConnections(List.of(conn("conn-A", 1, 0))));
         assertEquals(1, fake.historyCalls.size());
-        // New counters start a newer cycle before the first fetch lands.
-        onEdt(() -> ref.get().setConnections(List.of(conn("conn-A", 2, 0))));
-        assertEquals(2, fake.historyCalls.size());
-
-        fake.historyCalls.get(0).complete(history("stale", 1000));
+        for (int i = 0; i < 20; i++) {
+            onEdt(() -> ref.get().setConnections(List.of(conn("conn-A", 2, 0))));
+        }
+        assertEquals(1, fake.historyCalls.size(), "coalesce while the request is pending");
+        fake.historyCalls.get(0).complete(history("first", 1000));
         flush();
-        onEdt(() -> assertTrue(ref.get().displayedChunks().isEmpty(),
-                "a fetch superseded by a newer cycle must be ignored"));
+        onEdt(() -> {
+            assertEquals("first", ref.get().displayedChunks().get(0).getChunkId());
+            ref.get().refreshLive();
+        });
+        assertEquals(2, fake.historyCalls.size(), "new counters must still be fetched");
         fake.historyCalls.get(1).complete(history("fresh", 2000));
         flush();
         onEdt(() -> assertEquals("fresh", ref.get().displayedChunks().get(0).getChunkId()));
+    }
+
+    @Test
+    void everyConnectionIsFetchedWithBoundedConcurrency() throws Exception {
+        FakeControlPlane fake = new FakeControlPlane();
+        AtomicReference<HistoryPanel> ref = new AtomicReference<>();
+        onEdt(() -> ref.set(new HistoryPanel(fake)));
+        List<BurpTcp.ConnectionInfo> rows = java.util.stream.IntStream.range(0, 70)
+                .mapToObj(i -> conn("conn-" + i, 1, 0)).toList();
+        onEdt(() -> ref.get().setConnections(rows));
+        for (int i = 0; i < rows.size(); i++) {
+            assertTrue(fake.historyCalls.size() > i, "connection " + i + " was starved");
+            assertTrue(fake.historyCalls.size() - i <= 2, "history must leave room for control RPCs");
+            fake.historyCalls.get(i).complete(history("chunk-" + i, i));
+            flush();
+        }
+        assertEquals(70, new java.util.HashSet<>(fake.historyConnIds).size());
+        onEdt(() -> assertEquals(70, ref.get().displayedChunks().size()));
     }
 
     @Test
@@ -158,6 +179,52 @@ class HistoryPanelTest {
         flush();
         onEdt(() -> assertTrue(ref.get().displayedChunks().isEmpty(),
                 "a fetch completing after clear must be ignored"));
+    }
+
+    @Test
+    void failedFetchRetriesAndClearCannotCorruptNewSession() throws Exception {
+        FakeControlPlane fake = new FakeControlPlane();
+        AtomicReference<HistoryPanel> ref = new AtomicReference<>();
+        onEdt(() -> ref.set(new HistoryPanel(fake)));
+        onEdt(() -> ref.get().setConnections(List.of(conn("old", 1, 0))));
+        onEdt(() -> {
+            ref.get().clear();
+            ref.get().setConnections(List.of(conn("new", 1, 0)));
+        });
+        fake.historyCalls.get(0).complete(history("stale", 1));
+        fake.historyCalls.get(1).completeExceptionally(new java.io.IOException("test failure"));
+        flush();
+        onEdt(() -> {
+            assertTrue(ref.get().displayedChunks().isEmpty());
+            assertTrue(ref.get().statusText().contains("test failure"));
+            ref.get().refreshLive();
+        });
+        assertEquals(List.of("old", "new", "new"), fake.historyConnIds);
+        fake.historyCalls.get(2).complete(history("recovered", 2));
+        flush();
+        onEdt(() -> assertEquals("recovered", ref.get().displayedChunks().getFirst().getChunkId()));
+    }
+
+    @Test
+    void historyCacheHasGlobalPayloadBudget() throws Exception {
+        FakeControlPlane fake = new FakeControlPlane();
+        AtomicReference<HistoryPanel> ref = new AtomicReference<>();
+        onEdt(() -> ref.set(new HistoryPanel(fake)));
+        var rows = java.util.stream.IntStream.range(0, 20)
+                .mapToObj(i -> conn("conn-" + i, 1, 0)).toList();
+        onEdt(() -> ref.get().setConnections(rows));
+        var bytes = com.google.protobuf.ByteString.copyFrom(new byte[1024 * 1024]);
+        for (int i = 0; i < rows.size(); i++) {
+            fake.historyCalls.get(i).complete(BurpTcp.HistoryData.newBuilder()
+                    .addChunks(BurpTcp.TrafficChunkInfo.newBuilder().setChunkId("chunk-" + i)
+                            .setRecordedUnixMs(i).setBytes(bytes)).build());
+            flush();
+        }
+        onEdt(() -> {
+            var chunks = ref.get().displayedChunks();
+            assertTrue(chunks.stream().mapToLong(c -> c.getBytes().size()).sum() <= HistoryPanel.MAX_CACHE_BYTES);
+            assertEquals("chunk-19", chunks.getLast().getChunkId());
+        });
     }
 
     @Test

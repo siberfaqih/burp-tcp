@@ -518,6 +518,11 @@ impl SessionFinalizer {
     /// history open record is written first: capture starts exactly when
     /// forwarding starts, so no forwarded byte predates its connection.
     fn mark_established(&mut self, resolved_upstream: SocketAddr) {
+        self.registry.set_counters(
+            &self.conn_id,
+            Arc::clone(&self.bytes_c2s),
+            Arc::clone(&self.bytes_s2c),
+        );
         self.registry.mark_forwarding(&self.conn_id);
         self.established = true;
         self.resolved_upstream = Some(resolved_upstream);
@@ -599,6 +604,18 @@ impl SessionFinalizer {
 
         self.reported = true;
         self.registry.close(&self.conn_id);
+        self.history
+            .record_connection_rejected(crate::history::ConnectionRejected {
+                conn_id: self.conn_id.clone(),
+                requested_target: self.requested_target.clone().unwrap_or_default(),
+                requested_port: self.requested_port.unwrap_or(0),
+                reason: match error.reply_code() {
+                    Some(code) => {
+                        format!("SOCKS CONNECT failed (0x{code:02x}): {}", error.reason())
+                    }
+                    None => format!("SOCKS negotiation failed: {}", error.reason()),
+                },
+            });
         self.telemetry.emit(Event::SessionRejected {
             conn_id: self.conn_id.clone(),
             client_addr: self.client_addr,
@@ -651,8 +668,7 @@ impl Drop for SessionFinalizer {
             }
         };
         // History close for sessions that never reported through the normal
-        // path. Recorded only for established sessions (rejected ones never
-        // opened a history record). The built-in history enqueues with
+        // path. Rejected sessions retain only failure metadata. The built-in history enqueues with
         // try-locks and never waits for metadata snapshots/store locks,
         // including in this abort/unwind path. Metadata loss is counted.
         // The telemetry emit below remains guarded against sink panics.
@@ -665,6 +681,14 @@ impl Drop for SessionFinalizer {
                     reason: abnormal.to_owned(),
                 },
             );
+        } else {
+            self.history
+                .record_connection_rejected(crate::history::ConnectionRejected {
+                    conn_id: self.conn_id.clone(),
+                    requested_target: self.requested_target.clone().unwrap_or_default(),
+                    requested_port: self.requested_port.unwrap_or(0),
+                    reason: abnormal.to_owned(),
+                });
         }
         // A panicking sink must never escape cleanup: during unwinding this
         // would be a second panic and abort the process. The slot is already

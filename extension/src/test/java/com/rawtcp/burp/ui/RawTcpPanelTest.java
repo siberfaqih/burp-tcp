@@ -192,7 +192,8 @@ class RawTcpPanelTest {
                                 .setRequestedPort(7007).setEstablished(true))
                         .build());
         fake.statsResult = CompletableFuture.completedFuture(BurpTcp.Stats.newBuilder()
-                .setC2SEnabled(true).setS2CEnabled(false).build());
+                .setC2SEnabled(true).setS2CEnabled(false)
+                .setActiveConnections(1).setAcceptedConnections(7).build());
         AtomicReference<RawTcpPanel> ref = new AtomicReference<>();
         onEdt(() -> ref.set(new RawTcpPanel(fake, SettingsStore.IN_MEMORY)));
         try {
