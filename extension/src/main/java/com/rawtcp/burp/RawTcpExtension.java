@@ -22,7 +22,7 @@ import com.rawtcp.burp.ui.RawTcpPanel;
 public final class RawTcpExtension implements BurpExtension {
 
     /** Extension version, reported in the {@code Hello} handshake. */
-    public static final String VERSION = "0.1.3";
+    public static final String VERSION = "0.1.4";
 
     @Override
     public void initialize(MontoyaApi api) {

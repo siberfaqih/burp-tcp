@@ -59,7 +59,7 @@ cargo test --workspace --locked   # engine + fixtures (fmt/clippy clean, warning
 cargo build --release --locked    # -> target/release/rawtcp-engine
 
 cd extension
-mvn clean verify                  # -> target/rawtcp-burp-extension-0.1.3.jar
+mvn clean verify                  # -> target/rawtcp-burp-extension-0.1.4.jar
 ```
 
 Windows binaries are built natively by CI (`.github/workflows/build-windows.yml`).
@@ -127,5 +127,5 @@ application through `127.0.0.1:1080` as its SOCKS5 proxy.
 ## Releases
 
 Versioned Windows assets (`rawtcp-engine.exe`,
-`rawtcp-burp-extension-0.1.3.jar`, `SHA256SUMS.txt`) are attached to GitHub
+`rawtcp-burp-extension-0.1.4.jar`, `SHA256SUMS.txt`) are attached to GitHub
 Releases, built by CI on `windows-latest`.

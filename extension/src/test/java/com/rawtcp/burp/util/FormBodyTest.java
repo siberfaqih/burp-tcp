@@ -79,7 +79,31 @@ class FormBodyTest {
         assertEquals("one two", form.fields().get(0).value());
         assertArrayEquals(bytes(wire), form.bytes());
         String edited = text(form.edit(1, "b", "/%2F").bytes());
-        assertEquals("a=one+two&b=%2F%252F\n", edited);
+        assertEquals("a=one+two&b=/%252F\n", edited);
+    }
+
+    @Test void editingLeavesOriginallyRawCharactersUnencoded() {
+        // Raw : / @ ! ' ( ) , ; $ [ ] ? # stay raw; only % + & =,
+        // spaces, controls, and non-ASCII are encoded.
+        FormBody form = FormBody.parse(bytes("id=abc:def/ghi@jkl"));
+        assertEquals("id=abc:def/ghi@jkl!", text(form.edit(0, "id", "abc:def/ghi@jkl!").bytes()));
+        assertEquals("id=a%26b%3Dc%2Bd%25e+f",
+                text(form.edit(0, "id", "a&b=c+d%e f").bytes()));
+        // %20-style fields keep %20 for spaces while still leaving / raw.
+        FormBody spaced = FormBody.parse(bytes("q=hello%20world"));
+        assertEquals("q=a%20b/c", text(spaced.edit(0, "q", "a b/c").bytes()));
+        // Structural characters in names are still encoded.
+        assertEquals("a%26b=abc:def/ghi@jkl", text(form.edit(0, "a&b", "abc:def/ghi@jkl").bytes()));
+        // Round-trips: re-parsing the edited wire yields what was typed.
+        assertEquals("a&b=c+d%e f",
+                FormBody.parse(bytes(text(form.edit(0, "id", "a&b=c+d%e f").bytes())))
+                        .fields().getFirst().value());
+    }
+
+    @Test void asteriskInNameParsesSinceEncoderLeavesItRaw() {
+        FormBody form = FormBody.parse(bytes("a*b=1"));
+        assertEquals("1", form.fields().getFirst().value());
+        assertArrayEquals(bytes("a*b=1"), form.bytes());
     }
 
     @Test void damagedLineEndingFallsBackToNormalizedView() {

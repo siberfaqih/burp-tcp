@@ -24,7 +24,7 @@ cd extension
 mvn clean verify          # compiles proto, runs tests, produces the jar
 ```
 
-Output: `target/rawtcp-burp-extension-0.1.3.jar` — a single shaded jar with
+Output: `target/rawtcp-burp-extension-0.1.4.jar` — a single shaded jar with
 `protobuf-java` bundled and the Montoya API excluded (Burp supplies it).
 
 The canonical schema `../proto/burp_tcp.proto` is compiled by `protoc`
@@ -171,6 +171,9 @@ current TCP chunk. Detection is ASCII-only: proper form encoding is ASCII
 the raw editor instead of being misread as parameters. The **Body parameters** sidebar displays decoded names and
 values. Edit a cell and click **Forward** / **Send**: the active cell is committed
 and the edited component is encoded back into the wire payload automatically.
+Only characters that would break field parsing (`% + & =`), spaces, controls,
+and non-ASCII are percent-encoded; characters that arrived raw (`: / @` and
+similar) stay raw, and the field's space style (`+` vs `%20`) is preserved.
 The raw/hex view updates immediately. Names can be edited too; duplicate names,
 ordering, empty values, bare flags and untouched escape spellings are preserved.
 `+` decodes as space, `%2B` as a literal plus, and `%252F` decodes once to `%2F`.

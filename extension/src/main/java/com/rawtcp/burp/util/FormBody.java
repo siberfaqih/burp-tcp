@@ -119,7 +119,7 @@ public final class FormBody {
             int equals = part.indexOf('=');
             String rawName = equals < 0 ? part : part.substring(0, equals);
             String rawValue = equals < 0 ? "" : part.substring(equals + 1);
-            if (!rawName.matches("[A-Za-z0-9_. $~%+\\[\\]-]*")
+            if (!rawName.matches("[A-Za-z0-9_. $~%+*\\[\\]-]*")
                     || part.chars().anyMatch(c -> c < 32 || c == 127))
                 throw new IllegalArgumentException("No form body detected in this chunk");
             fields.add(new Field(rawName, rawValue, equals >= 0,
@@ -141,7 +141,38 @@ public final class FormBody {
     }
 
     private static String encodeLike(String text, String previous) {
-        return UrlCodec.encode(text, !previous.contains("%20"));
+        return encodeMinimal(text, !previous.contains("%20"));
+    }
+
+    /**
+     * Minimal form encoding for edited components: only characters that
+     * would break field parsing ({@code % + & =}), spaces, controls, and
+     * non-ASCII are percent-encoded. Everything else that commonly arrives
+     * raw ({@code : / @ ! ' ( ) , ; $ [ ] ? #} ...) stays raw, so editing a
+     * plain value does not rewrite it into percent-escapes. Space style
+     * follows the field being edited ({@code +} vs {@code %20}).
+     */
+    static String encodeMinimal(String text, boolean spaceAsPlus) {
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < text.length();) {
+            int cp = text.codePointAt(i);
+            i += Character.charCount(cp);
+            if (cp == ' ') {
+                out.append(spaceAsPlus ? "+" : "%20");
+            } else if (cp < 0x80 && cp != '%' && cp != '+' && cp != '&' && cp != '='
+                    && cp >= 0x20 && cp != 0x7f) {
+                out.append((char) cp);
+            } else {
+                // Controls, DEL, % + & =, and non-ASCII: percent-encode the
+                // UTF-8 bytes. Lone surrogates fail here as an edit error.
+                byte[] raw = UrlCodec.utf8(new String(Character.toChars(cp)));
+                for (byte b : raw) {
+                    out.append('%').append("0123456789ABCDEF".charAt((b >> 4) & 0xF))
+                            .append("0123456789ABCDEF".charAt(b & 0xF));
+                }
+            }
+        }
+        return out.toString();
     }
 
     public byte[] bytes() {

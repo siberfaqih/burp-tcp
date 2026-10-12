@@ -6,7 +6,7 @@
 
   <groupId>com.rawtcp.burp</groupId>
   <artifactId>rawtcp-burp-extension</artifactId>
-  <version>0.1.3</version>
+  <version>0.1.4</version>
   <packaging>jar</packaging>
 
   <name>Burp Raw TCP Extension</name>

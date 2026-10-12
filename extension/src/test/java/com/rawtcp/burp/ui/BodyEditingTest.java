@@ -179,6 +179,19 @@ class BodyEditingTest {
         });
     }
 
+    @Test void parameterEditLeavesOriginallyRawCharactersUnencoded() throws Exception {
+        edt(() -> {
+            BinaryEditorPanel editor = new BinaryEditorPanel();
+            byte[] original = bytes("id=abc:def/ghi@jkl");
+            editor.setBytes(original, false);
+            assertEquals("abc:def/ghi@jkl", editor.parameters().table().getValueAt(0, 1));
+            editor.parameters().table().setValueAt("abc:def/ghi@jkl!", 0, 1);
+            assertEquals("id=abc:def/ghi@jkl!", text(editor.getBytes()));
+            editor.parameters().table().setValueAt("a&b=c+d%e f", 0, 1);
+            assertEquals("id=a%26b%3Dc%2Bd%25e+f", text(editor.getBytes()));
+        });
+    }
+
     @Test void pastedLfOnlyHttpRequestShowsParameters() throws Exception {        edt(() -> {
             BinaryEditorPanel editor = new BinaryEditorPanel();
             String wire = "POST /login HTTP/1.1\nHost: localhost\n"
