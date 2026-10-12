@@ -39,6 +39,10 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
     private final JButton connectButton = new JButton("Connect");
     private final JLabel status = new JLabel(" ");
     private final JLabel events = new JLabel(" ");
+    private final JLabel banner = new JLabel("Not connected.");
+    private int lastQueueCount;
+    private String lastSocksAddr = "";
+    private String lastDisconnectReason = "";
 
     private final ConnectionsPanel connections;
     private final HistoryPanel history;
@@ -77,7 +81,10 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
         this.repeater = new RepeaterWorkspace(client);
 
         connections.setSelectionListener(history::setConnection);
-        connections.setSnapshotListener(history::setConnections);
+        connections.setSnapshotListener(rows -> {
+            history.setConnections(rows);
+            updateBanner();
+        });
         history.setRepeaterListener(this::sendToRepeater);
         intercept.setRepeaterListener(this::sendToRepeater);
         history.setDecoderListener(this::sendToDecoder);
@@ -90,9 +97,12 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
         intercept.setDestinationResolver(destination);
         history.setDestinationResolver(destination);
         intercept.setQueueListener(count -> {
+            lastQueueCount = count;
+            updateBanner();
             int index = tabs.indexOfComponent(intercept);
             if (index >= 0) tabs.setTitleAt(index, count == 0 ? "Intercept" : "Intercept (" + count + ")");
         });
+        intercept.setPolicyListener(() -> SwingUtilities.invokeLater(this::updateBanner));
 
         portField.setText(settings.get(KEY_PORT, "8080"));
         tokenField.setText(settings.get(KEY_TOKEN, ""));
@@ -118,6 +128,7 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
         statusRow.add(status, BorderLayout.WEST);
         statusRow.add(events, BorderLayout.EAST);
         north.add(bar, BorderLayout.NORTH);
+        north.add(banner, BorderLayout.CENTER);
         north.add(statusRow, BorderLayout.SOUTH);
 
         add(north, BorderLayout.NORTH);
@@ -127,6 +138,7 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
 
         statusTimer = new Timer(500, event -> {
             status.setText(client.status());
+            updateBanner();
             // Periodically reconcile the authoritative interception policy so
             // a change made by another controller (or a fail-open) is shown
             // even when no count-bearing event fires.
@@ -140,6 +152,39 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
         });
         statusTimer.setInitialDelay(0);
         statusTimer.start();
+    }
+
+    /**
+     * One-line setup truth: which engine, which proxy address the app must
+     * use, live policy, and live counts. Unmissable when disconnected, so a
+     * stale token or a wrong proxy port reads as what it is instead of
+     * "intercept stopped working".
+     */
+    private void updateBanner() {
+        if (disposed) {
+            return;
+        }
+        if (!connected || !client.isConnected()) {
+            String cause = lastDisconnectReason.isEmpty() ? client.status() : lastDisconnectReason;
+            banner.setText("NOT CONNECTED — " + cause
+                    + " · check the engine window, IPC port, and token");
+            banner.setForeground(java.awt.Color.RED);
+            return;
+        }
+        boolean[] policy = intercept.displayedEnabledState();
+        String epoch = lastEpoch == null || lastEpoch.length() < 8 ? "?" : lastEpoch.substring(0, 8);
+        banner.setText("engine " + epoch + " · app proxy → "
+                + (lastSocksAddr.isEmpty() ? "?" : lastSocksAddr)
+                + " · to server " + (policy[0] ? "ON" : "off")
+                + " · to client " + (policy[1] ? "ON" : "off")
+                + " · " + connectionsPanel().rowCount() + " live"
+                + " · " + lastQueueCount + " held");
+        banner.setForeground(javax.swing.UIManager.getColor("Label.foreground"));
+    }
+
+    /** Setup banner text, for tests. */
+    String bannerText() {
+        return banner.getText();
     }
 
     private void sendToRepeater(String connId, byte[] bytes) {
@@ -181,7 +226,7 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
         if (disposed) {
             return;
         }
-        if (started) {
+        if (started && client.isConnected()) {
             // Invalidate any callback already queued for this session before
             // clearing state, so a stale onConnected cannot re-enable it.
             sessionEpoch++;
@@ -193,6 +238,10 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
             return;
         }
 
+        // Reconnect path (also covers "started but the socket died", e.g.
+        // after an engine restart): use the current fields, so pasting a
+        // fresh token and pressing the button once is enough. No full
+        // re-setup, no extension re-import.
         String rawPort = portField.getText().trim();
         int port;
         try {
@@ -252,18 +301,23 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
                 events.setText(" ");
             }
             lastEpoch = ack.getDaemonEpoch();
+            lastSocksAddr = ack.getSocksAddr();
+            lastDisconnectReason = "";
             intercept.setConnected(true);
             repeater.setConnected(true);
             connections.refresh();
             intercept.refreshAll();
+            updateBanner();
         });
     }
 
     @Override
     public void onDisconnected(String reason) {
         onEdtIfCurrent(() -> {
+            lastDisconnectReason = reason;
             status.setText("disconnected: " + reason);
             onDisconnectedInternal();
+            updateBanner();
         });
     }
 

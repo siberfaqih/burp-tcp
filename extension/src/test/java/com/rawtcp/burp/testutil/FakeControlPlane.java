@@ -21,9 +21,11 @@ public final class FakeControlPlane implements IpcSession {
     public final List<BurpTcp.RepeaterStop> repeaterStopCalls = new CopyOnWriteArrayList<>();
     public final List<BurpTcp.RepeaterStatus> repeaterStatusCalls = new CopyOnWriteArrayList<>();
     public final List<String> historyConnIds = new CopyOnWriteArrayList<>();
+    public final List<Integer> historyMaxChunks = new CopyOnWriteArrayList<>();
     public final List<CompletableFuture<BurpTcp.HistoryData>> historyCalls =
             new CopyOnWriteArrayList<>();
     public boolean started;
+    public int startCalls;
 
     /** Completed by default; replace to control timing. */
     public volatile CompletableFuture<BurpTcp.ConnectionList> listConnectionsResult =
@@ -62,8 +64,9 @@ public final class FakeControlPlane implements IpcSession {
 
     @Override
     public CompletableFuture<BurpTcp.HistoryData> historySnapshot(
-            String connId, BurpTcp.Direction direction) {
+            String connId, BurpTcp.Direction direction, int maxChunks) {
         historyConnIds.add(connId);
+        historyMaxChunks.add(maxChunks);
         CompletableFuture<BurpTcp.HistoryData> future = new CompletableFuture<>();
         historyCalls.add(future);
         return future;
@@ -159,8 +162,14 @@ public final class FakeControlPlane implements IpcSession {
 
     @Override
     public boolean isConnected() {
+        if (connectedOverride != null) {
+            return connectedOverride;
+        }
         return true;
     }
+
+    /** Force isConnected() for reconnect-path tests; null restores default. */
+    public volatile Boolean connectedOverride;
 
     @Override
     public void addListener(IpcListener listener) {
@@ -175,6 +184,7 @@ public final class FakeControlPlane implements IpcSession {
     @Override
     public void start(String host, int port, String token) {
         started = true;
+        startCalls++;
     }
 
     @Override

@@ -159,4 +159,26 @@ class HistoryPanelTest {
         onEdt(() -> assertTrue(ref.get().displayedChunks().isEmpty(),
                 "a fetch completing after clear must be ignored"));
     }
+
+    @Test
+    void snapshotsAreBoundedAndTotalsReported() throws Exception {
+        FakeControlPlane fake = new FakeControlPlane();
+        AtomicReference<HistoryPanel> ref = new AtomicReference<>();
+        onEdt(() -> ref.set(new HistoryPanel(fake)));
+
+        onEdt(() -> ref.get().setConnections(List.of(conn("conn-A", 9, 0))));
+        assertEquals(1, fake.historyCalls.size());
+        assertEquals(HistoryPanel.HISTORY_MAX_CHUNKS, fake.historyMaxChunks.get(0),
+                "bulk transfers must not pull unbounded snapshots");
+
+        BurpTcp.HistoryData partial = BurpTcp.HistoryData.newBuilder()
+                .addChunks(BurpTcp.TrafficChunkInfo.newBuilder().setChunkId("tail")
+                        .setBytes(com.google.protobuf.ByteString.copyFrom(new byte[] {0x01})))
+                .setTotalChunks(6000)
+                .build();
+        fake.historyCalls.get(0).complete(partial);
+        flush();
+        onEdt(() -> assertTrue(ref.get().statusText().contains("newest 1 of 6000"),
+                "truncation must be honest, got: " + ref.get().statusText()));
+    }
 }

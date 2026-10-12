@@ -201,6 +201,7 @@ pub async fn spawn_relay_with(
                 Arc::clone(&registry),
                 Arc::clone(&history),
                 Arc::clone(&intercept),
+                local_addr,
             )
             .await
             .map_err(|source| ServeError::IpcBind {

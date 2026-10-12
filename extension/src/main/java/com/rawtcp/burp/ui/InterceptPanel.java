@@ -408,7 +408,12 @@ public final class InterceptPanel extends JPanel {
         } finally {
             syncing = false;
         }
+        policyListener.run();
     }
+
+    /** Refresh the setup banner in the containing panel when policy lands. */
+    public void setPolicyListener(Runnable listener) { policyListener = listener; }
+    private Runnable policyListener = () -> {};
 
     private void applyEnabled(BurpTcp.Direction direction, boolean enabled) {
         if (syncing) {

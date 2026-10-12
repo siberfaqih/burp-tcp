@@ -57,4 +57,32 @@ class ConnectionsPanelTest {
         onEdt(() -> assertEquals(0, ref.get().rowCount(),
                 "a response after clear must be ignored"));
     }
+
+    @Test
+    void closedRowsShowTerminalReason() throws Exception {
+        FakeControlPlane fake = new FakeControlPlane();
+        fake.listConnectionsResult = CompletableFuture.completedFuture(
+                BurpTcp.ConnectionList.newBuilder()
+                        .addConnections(BurpTcp.ConnectionInfo.newBuilder()
+                                .setConnId("dead")
+                                .setRequestedHost("10.0.0.9").setRequestedPort(7007)
+                                .setEstablished(false).setClosed(true)
+                                .setBytesClientToServer(433).setBytesServerToClient(0)
+                                .setCloseReason("client_to_server: connection reset"))
+                        .addConnections(BurpTcp.ConnectionInfo.newBuilder()
+                                .setConnId("live")
+                                .setRequestedHost("10.0.0.9").setRequestedPort(7007)
+                                .setEstablished(true))
+                        .build());
+        AtomicReference<ConnectionsPanel> ref = new AtomicReference<>();
+        onEdt(() -> ref.set(new ConnectionsPanel(fake)));
+        onEdt(() -> ref.get().refresh());
+        flush();
+        onEdt(() -> {
+            assertEquals(2, ref.get().rowCount());
+            assertEquals("client_to_server: connection reset", ref.get().cellValue(0, 6));
+            assertEquals("", ref.get().cellValue(1, 6),
+                    "live connections have no terminal reason");
+        });
+    }
 }

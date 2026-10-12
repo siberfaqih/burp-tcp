@@ -222,10 +222,11 @@ public final class IpcClient implements IpcSession {
 
     @Override
     public CompletableFuture<BurpTcp.HistoryData> historySnapshot(
-            String connId, BurpTcp.Direction direction) {
+            String connId, BurpTcp.Direction direction, int maxChunks) {
         BurpTcp.HistorySnapshot snapshot = BurpTcp.HistorySnapshot.newBuilder()
                 .setConnId(connId)
                 .setDirection(direction)
+                .setMaxChunks(Math.max(0, maxChunks))
                 .build();
         return request(r -> r.setHistorySnapshot(snapshot))
                 .thenApply(resp -> require(resp, resp.hasHistoryData(),
@@ -625,6 +626,13 @@ public final class IpcClient implements IpcSession {
         switch (message.getBodyCase()) {
             case RESPONSE -> {
                 BurpTcp.Response response = message.getResponse();
+                if (!conn.acknowledged && response.hasError()) {
+                    // Frames arrive in order, so a pre-ack Error (bad token,
+                    // version mismatch) is always recorded before the Close
+                    // that follows it. handleClosed prefers it over the bare
+                    // transport reason, deterministically.
+                    conn.preAckError = response.getError().getMessage();
+                }
                 CompletableFuture<BurpTcp.Response> future =
                         removePending(conn, response.getRequestId());
                 if (future != null) {
@@ -665,6 +673,14 @@ public final class IpcClient implements IpcSession {
         if (!first) {
             return;
         }
+        // A pre-acknowledgement Error frame (bad token, version mismatch)
+        // names the real cause; the transport close that follows it does
+        // not. Prefer it so a stale token reads as "paste the new token",
+        // not as a bare disconnect.
+        String display = reason;
+        if (!conn.acknowledged && conn.preAckError != null && !conn.preAckError.isEmpty()) {
+            display = "handshake rejected: " + conn.preAckError;
+        }
         // Publish the disconnect atomically with respect to start()/stop(): a
         // connection that was already superseded or stopped must not clear
         // newer state or notify listeners. Notification happens under the same
@@ -676,10 +692,10 @@ public final class IpcClient implements IpcSession {
                 return;
             }
             daemonEpoch = null;
-            setStatus("disconnected: " + reason);
+            setStatus("disconnected: " + display);
             for (IpcListener listener : listeners) {
                 try {
-                    listener.onDisconnected(reason);
+                    listener.onDisconnected(display);
                 } catch (RuntimeException ignored) {
                     // Isolate listener failures.
                 }
@@ -739,6 +755,8 @@ public final class IpcClient implements IpcSession {
         final java.util.concurrent.atomic.AtomicReference<WebSocket> socket =
                 new java.util.concurrent.atomic.AtomicReference<>();
         volatile boolean acknowledged;
+        /** Last top-level Error body seen before acknowledgement, if any. */
+        volatile String preAckError;
     }
 
     /** Per-connection WebSocket listener bound to its {@link Connection}. */

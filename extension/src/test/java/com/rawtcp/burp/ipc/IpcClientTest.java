@@ -111,8 +111,64 @@ class IpcClientTest {
     }
 
     @Test
-    void correlatesResponseByRequestId() throws Exception {
-        CountDownLatch connected = new CountDownLatch(1);
+    void staleTokenReportsActionableRejection() throws Exception {
+        CountDownLatch disconnected = new CountDownLatch(1);
+        AtomicReference<String> reason = new AtomicReference<>();
+
+        TestWebSocketServer server = new TestWebSocketServer(session -> {
+            try {
+                byte[] helloFrame = session.readBinary();
+                if (helloFrame == null) {
+                    return;
+                }
+                BurpTcp.Request hello = BurpTcp.ClientMessage.parseFrom(helloFrame).getRequest();
+                byte[] rejection = BurpTcp.ServerMessage.newBuilder()
+                        .setResponse(BurpTcp.Response.newBuilder()
+                                .setRequestId(hello.getRequestId())
+                                .setError(BurpTcp.Error.newBuilder()
+                                        .setCode(4401)
+                                        .setMessage("bad capability token: the engine restarted; paste the token it just printed")))
+                        .build()
+                        .toByteArray();
+                session.sendBinary(rejection);
+                session.close();
+            } catch (IOException ignored) {
+                // Test teardown.
+            }
+        });
+
+        IpcClient client = new IpcClient("test", "1.0");
+        client.addListener(new IpcListener() {
+            @Override
+            public void onConnected(BurpTcp.HelloAck ack) {
+            }
+
+            @Override
+            public void onDisconnected(String value) {
+                reason.set(value);
+                disconnected.countDown();
+            }
+
+            @Override
+            public void onEvent(BurpTcp.Event event) {
+            }
+        });
+
+        try {
+            client.start("127.0.0.1", server.port(), "stale-token");
+            assertTrue(disconnected.await(TIMEOUT_SECONDS, TimeUnit.SECONDS), "no disconnect");
+            assertTrue(reason.get().contains("bad capability token"),
+                    "rejection must name the token, got: " + reason.get());
+            assertTrue(client.status().contains("bad capability token"),
+                    "status must name the token, got: " + client.status());
+        } finally {
+            client.close();
+            server.close();
+        }
+    }
+
+    @Test
+    void correlatesResponseByRequestId() throws Exception {        CountDownLatch connected = new CountDownLatch(1);
 
         TestWebSocketServer server = new TestWebSocketServer(session -> {
             try {

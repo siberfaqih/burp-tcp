@@ -90,6 +90,18 @@ application through `127.0.0.1:1080` as its SOCKS5 proxy.
 - Diagnose from the Intercept stats line: rising `Bypassed (queue full)` =
   saturated queue; rising `Expired` = units auto-released after the 30 s
   lease because nobody decided in time.
+- The banner under the connect bar always shows engine epoch, the
+  `app proxy →` address the target must use, live policy, and live/held
+  counts. If traffic bypasses intercept, read it first: red `NOT CONNECTED`
+  means the socket is dead (stale token after an engine restart is the usual
+  cause — the engine names it explicitly, paste the fresh token and press the
+  button once); policy `off` means fail-open or an unticked box, not a bug.
+- The Connections **Ended** column shows why each closed session ended.
+  History fetches at most 300 newest chunks per connection per direction
+  ("newest K of N") so bulk transfers cannot wedge the control plane.
+- One engine at a time: a second `rawtcp-engine.exe` cannot bind the same
+  ports and exits. If Burp was killed instead of unloaded, the engine reaps
+  the half-open controller after 60 s idle and frees its slot.
 
 ## Releases
 

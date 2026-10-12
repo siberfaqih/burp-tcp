@@ -53,6 +53,12 @@ public final class HistoryPanel extends JPanel {
 
     /** Maximum connections fetched per refresh cycle (bounds snapshot RPCs). */
     static final int MAX_FETCH_CONNECTIONS = 32;
+    /**
+     * Newest chunks requested per connection per direction. Bounds every
+     * snapshot so one bulk transfer cannot wedge the control plane; the
+     * engine reports the retained total alongside.
+     */
+    static final int HISTORY_MAX_CHUNKS = 300;
 
     private final ControlPlane client;
     private final Model model = new Model();
@@ -95,6 +101,7 @@ public final class HistoryPanel extends JPanel {
         long fetchedC2s = -1;
         long fetchedS2c = -1;
         List<BurpTcp.TrafficChunkInfo> chunks = List.of();
+        long totalChunks;
     }
 
     public HistoryPanel(ControlPlane client) {
@@ -260,12 +267,13 @@ public final class HistoryPanel extends JPanel {
             String id = info.getConnId();
             long c2s = info.getBytesClientToServer();
             long s2c = info.getBytesServerToClient();
-            client.historySnapshot(id, BurpTcp.Direction.DIRECTION_UNSPECIFIED)
+            client.historySnapshot(id, BurpTcp.Direction.DIRECTION_UNSPECIFIED, HISTORY_MAX_CHUNKS)
                     .whenComplete((data, error) -> SwingUtilities.invokeLater(() -> {
                         if (cycle != cycleSeq) return;
                         ConnCache cache = caches.get(id);
                         if (cache != null && error == null) {
                             cache.chunks = List.copyOf(data.getChunksList());
+                            cache.totalChunks = data.getTotalChunks();
                             cache.fetchedC2s = c2s;
                             cache.fetchedS2c = s2c;
                         } else if (error != null) {
@@ -356,8 +364,14 @@ public final class HistoryPanel extends JPanel {
         refilter();
         showSelected();
         int conns = filterConnId != null ? 1 : caches.size();
+        long total = 0;
+        for (Map.Entry<String, ConnCache> entry : caches.entrySet()) {
+            if (filterConnId != null && !entry.getKey().equals(filterConnId)) continue;
+            total += Math.max(entry.getValue().totalChunks, entry.getValue().chunks.size());
+        }
         status.setText(table.getRowCount() + " / " + model.getRowCount()
                 + " chunks across " + conns + " connection(s)"
+                + (total > model.getRowCount() ? " · newest " + model.getRowCount() + " of " + total : "")
                 + (latestConns.size() > MAX_FETCH_CONNECTIONS && filterConnId == null
                         ? " · showing first " + MAX_FETCH_CONNECTIONS : "")
                 + " · exact forwarded bytes");
@@ -410,6 +424,8 @@ public final class HistoryPanel extends JPanel {
     void selectRow(int row) { table.setRowSelectionInterval(row, row); }
     void setSearch(String text) { search.setText(text); }
     JTable trafficTable() { return table; }
+    /** Status line text, for tests. */
+    String statusText() { return status.getText(); }
     /** Pick the traffic-direction filter by index, for tests. */
     void selectDirection(int index) { direction.setSelectedIndex(index); }
     /** Connection filter entries shown, for tests. */

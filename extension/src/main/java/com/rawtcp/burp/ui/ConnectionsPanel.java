@@ -25,7 +25,11 @@ public final class ConnectionsPanel extends JPanel {
     private final JTable table = new JTable(model) {
         @Override public String getToolTipText(java.awt.event.MouseEvent event) {
             int row = rowAtPoint(event.getPoint());
-            return row < 0 ? null : "Connection " + model.get(convertRowIndexToModel(row)).getConnId();
+            if (row < 0) return null;
+            BurpTcp.ConnectionInfo info = model.get(convertRowIndexToModel(row));
+            String tip = "Connection " + info.getConnId();
+            if (!info.getCloseReason().isEmpty()) tip += " · ended: " + info.getCloseReason();
+            return tip;
         }
     };
     private Consumer<String> selectionListener = connId -> {};
@@ -119,10 +123,15 @@ public final class ConnectionsPanel extends JPanel {
         return model.getRowCount();
     }
 
+    /** Cell value at a view position, for tests. */
+    Object cellValue(int viewRow, int column) {
+        return model.getValueAt(table.convertRowIndexToModel(viewRow), column);
+    }
+
     private static final class Model extends AbstractTableModel {
 
         private static final String[] COLUMNS =
-                {"#", "Host", "Port", "Status", "Sent (bytes)", "Received (bytes)"};
+                {"#", "Host", "Port", "Status", "Sent (bytes)", "Received (bytes)", "Ended"};
 
         private List<BurpTcp.ConnectionInfo> rows = new ArrayList<>();
 
@@ -151,7 +160,7 @@ public final class ConnectionsPanel extends JPanel {
         }
 
         @Override public Class<?> getColumnClass(int column) {
-            return column == 0 || column == 2 ? Integer.class : column >= 4 ? Long.class : String.class;
+            return column == 0 || column == 2 ? Integer.class : column >= 4 && column <= 5 ? Long.class : String.class;
         }
 
         @Override
@@ -163,7 +172,8 @@ public final class ConnectionsPanel extends JPanel {
                 case 2 -> info.getRequestedPort();
                 case 3 -> Display.connectionState(info);
                 case 4 -> info.getBytesClientToServer();
-                default -> info.getBytesServerToClient();
+                case 5 -> info.getBytesServerToClient();
+                default -> info.getCloseReason();
             };
         }
     }

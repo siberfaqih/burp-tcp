@@ -95,6 +95,13 @@ const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5
 /// handler cannot read.
 const IPC_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Idle read deadline for an authenticated connection. Live control planes
+/// poll at least every few hundred milliseconds, so a quieter socket is a
+/// dead peer (killed client, abandoned extension instance): reaping it frees
+/// its handler slot and lets the last-controller fail-open run instead of
+/// pinning policy and permits forever.
+const IPC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// RPC error codes for malformed repeater requests and repeater lifecycle
 /// conflicts. `44xx` continues the existing IPC error namespace.
 const REPEATER_INVALID_REQUEST: u32 = 4410;
@@ -156,6 +163,9 @@ struct IpcState {
     intercept: Arc<InterceptCoordinator>,
     daemon_epoch: String,
     capability_token: String,
+    /// Engine SOCKS listener address for the setup banner (e.g.
+    /// "127.0.0.1:1080").
+    socks_addr: String,
     ipc_dropped_events: Arc<AtomicU64>,
     /// Shared per-server event sequence. Every `StateChanged` event
     /// across every client gets the next value.
@@ -191,7 +201,12 @@ struct ControllerGuard {
 
 impl ControllerGuard {
     fn new(state: Arc<IpcState>) -> Self {
-        let mut count = state.authed_clients.lock().unwrap();
+        // Poison-tolerant: a panic elsewhere must never wedge future
+        // handshakes (which would force an engine restart to recover IPC).
+        let mut count = state
+            .authed_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *count += 1;
         drop(count);
         Self { state }
@@ -200,7 +215,11 @@ impl ControllerGuard {
 
 impl Drop for ControllerGuard {
     fn drop(&mut self) {
-        let mut count = self.state.authed_clients.lock().unwrap();
+        let mut count = self
+            .state
+            .authed_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *count = count.saturating_sub(1);
         if *count == 0 {
             // Last controller left: fail-open so no held unit waits out
@@ -255,6 +274,7 @@ pub(crate) async fn spawn_ipc(
     registry: Arc<ConnectionRegistry>,
     history: Arc<MemoryHistory>,
     intercept: Arc<InterceptCoordinator>,
+    socks_addr: SocketAddr,
 ) -> Result<IpcHandle, std::io::Error> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let listener = TcpListener::bind(addr).await?;
@@ -276,6 +296,7 @@ pub(crate) async fn spawn_ipc(
         intercept,
         daemon_epoch: daemon_epoch.clone(),
         capability_token: capability_token.clone(),
+        socks_addr: socks_addr.to_string(),
         ipc_dropped_events: Arc::clone(&ipc_dropped_events),
         event_seq: Arc::clone(&event_seq),
         event_capacity,
@@ -395,7 +416,20 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<IpcState>) 
         };
 
     if hello.capability_token != state.capability_token {
-        // Token mismatch: close without revealing state.
+        // Token mismatch (usually: engine restarted, old token pasted).
+        // Say so explicitly before closing so the control plane reports
+        // "paste the new token" instead of a bare disconnect.
+        let error = proto::ServerMessage {
+            body: Some(proto::ServerMessageBody::Response(proto::Response {
+                request_id,
+                body: Some(proto::ResponseBody::Error(proto::Error {
+                    code: 4401,
+                    message: "bad capability token: the engine restarted; paste the token it just printed"
+                        .into(),
+                })),
+            })),
+        };
+        let _ = ws.send(WsMessage::Binary(encode(&error))).await;
         let _ = ws.send(WsMessage::Close(None)).await;
         return Err(());
     }
@@ -425,6 +459,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<IpcState>) 
                 protocol_version: PROTOCOL_VERSION,
                 daemon_epoch: state.daemon_epoch.clone(),
                 server_version: env!("CARGO_PKG_VERSION").to_string(),
+                socks_addr: state.socks_addr.clone(),
             })),
         })),
     };
@@ -472,8 +507,16 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<IpcState>) 
         let repeater_pending = repeater_active.is_some();
         tokio::select! {
             biased;
-            // Client request.
-            frame = stream.next() => {
+            // Client request. The read carries the idle deadline: a live
+            // control plane polls every few hundred milliseconds, so a
+            // quieter socket is a dead peer. Reaping it frees its handler
+            // slot and runs last-controller fail-open instead of wedging
+            // IPC until an engine restart.
+            frame = async {
+                tokio::time::timeout(IPC_IDLE_TIMEOUT, stream.next())
+                    .await
+                    .unwrap_or_default()
+            } => {
                 let bytes = match frame {
                     Some(Ok(WsMessage::Binary(b))) => b,
                     Some(Ok(WsMessage::Close(_))) | None => break,
@@ -778,6 +821,9 @@ fn list_connections(state: &IpcState) -> proto::ConnectionList {
             closed,
             bytes_client_to_server: bytes_c2s,
             bytes_server_to_client: bytes_s2c,
+            // Live sessions have no terminal reason; closed ones retained
+            // only in history report it below.
+            close_reason: String::new(),
         });
     }
 
@@ -794,6 +840,7 @@ fn list_connections(state: &IpcState) -> proto::ConnectionList {
             closed: rec.closed_wall.is_some(),
             bytes_client_to_server: rec.bytes_client_to_server,
             bytes_server_to_client: rec.bytes_server_to_client,
+            close_reason: rec.close_reason.clone().unwrap_or_default(),
         });
     }
 
@@ -801,18 +848,32 @@ fn list_connections(state: &IpcState) -> proto::ConnectionList {
 }
 
 fn history_snapshot(state: &IpcState, hs: &proto::HistorySnapshot) -> proto::HistoryData {
-    let direction = proto_direction_to_engine(hs.direction);
-    let chunks = match direction {
-        Some(dir) => state.history.chunks_for_direction(&hs.conn_id, dir),
+    // Newest-first truncation per direction bounds snapshot cost so a bulk
+    // transfer cannot wedge the control plane behind a tens-of-megabytes
+    // response — while keeping the quiet direction visible. Chunks carry
+    // per-direction seq; the UI re-sorts by recorded time.
+    let cap = hs.max_chunks as usize;
+    let mut total_chunks = 0u64;
+    let mut newest = |mut vec: Vec<crate::history::TrafficChunk>| {
+        total_chunks += vec.len() as u64;
+        if cap > 0 && vec.len() > cap {
+            vec.drain(..vec.len() - cap);
+        }
+        vec
+    };
+    let chunks = match proto_direction_to_engine(hs.direction) {
+        Some(dir) => newest(state.history.chunks_for_direction(&hs.conn_id, dir)),
         None => {
-            let mut all = state
-                .history
-                .chunks_for_direction(&hs.conn_id, Direction::ClientToServer);
-            all.extend(
+            let mut all = newest(
+                state
+                    .history
+                    .chunks_for_direction(&hs.conn_id, Direction::ClientToServer),
+            );
+            all.extend(newest(
                 state
                     .history
                     .chunks_for_direction(&hs.conn_id, Direction::ServerToClient),
-            );
+            ));
             all
         }
     };
@@ -834,6 +895,7 @@ fn history_snapshot(state: &IpcState, hs: &proto::HistorySnapshot) -> proto::His
         .collect();
     proto::HistoryData {
         chunks: chunk_infos,
+        total_chunks,
     }
 }
 

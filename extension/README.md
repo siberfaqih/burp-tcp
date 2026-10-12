@@ -51,12 +51,21 @@ The canonical schema `../proto/burp_tcp.proto` is compiled by `protoc`
    capability token, then click **Connect**.
 
 The token is per-launch: restarting the engine invalidates it. Port and token
-are remembered in Burp preferences between sessions.
+are remembered in Burp preferences between sessions. A stale token reports
+`handshake rejected: bad capability token` — paste the fresh token from the
+engine window and press the button once to reconnect; no extension re-import
+or full re-setup is needed. The banner under the connect bar always shows the
+truth: engine epoch, the `app proxy →` address the target must point at,
+live intercept policy, and live/held counts. Red `NOT CONNECTED` means the
+socket is dead — check the engine window, port, and token.
 
 ## Tabs
 
 - **Connections** — live sessions from `ListConnections`. Selecting a row
-  drives the History tab.
+  drives the History tab. The **Ended** column shows the engine's terminal
+  reason for closed sessions (`eof`, `closed by interception decision`,
+  transport errors) — a `0 / 0`-byte closed row with a reason names the
+  failure instead of leaving a mystery drop.
 - **TCP history** — one passive log of every forwarded chunk across all
   connections, newest last, like Burp's HTTP history. Nothing needs selecting
   first: traffic appears on its own while Live is on. The connection dropdown
@@ -83,10 +92,11 @@ are remembered in Burp preferences between sessions.
   connections run past intercept, the queue (default 128) is the bottleneck,
   not the proxy rules.
   A replacement that changes the byte size warns inline after commit, because
-  length-framed protocols (HTTP, TDS) may reject it. A raw-text edit that
-  breaks a complete HTTP/1.x `Content-Length` message is refused before
-  sending, with exact declared-vs-actual numbers — edit via Body parameters
-  (which updates the header) or fix the header manually. Chunk fragments,
+  length-framed protocols (HTTP, TDS) may reject it. In Text mode a complete
+  single-`Content-Length` HTTP/1.x message maintains itself: body edits update
+  the header automatically on send (announced inline), so Forward transmits a
+  consistent message. Hex mode sends exact bytes by contract — deliberate
+  framing probes belong there, never rewritten. Chunk fragments,
   chunked/compressed bodies, and non-HTTP payloads are never auto-modified.
   A unit past the first slice of its stream is labelled
   `stream slice #N`: Drop/Replace there alters a running transfer and Close
@@ -172,10 +182,13 @@ tooltips rather than primary columns.
 - **Ctrl+R** (macOS **Cmd+R**): selected history/intercept bytes → new Repeater draft.
 - **Ctrl+Z / Ctrl+Y** (macOS **Cmd+Z / Cmd+Y**): undo/redo in the byte editor.
 
-History remains connection-scoped. TCP chunks are not application messages:
+History spans all connections with per-row destinations. TCP chunks are not
+application messages:
 importing one chunk does not reconstruct a full protocol conversation. Repeater
 opens a fresh connection, so it does not inherit authentication or session state.
 An evicted/unknown destination leaves the draft target empty for manual entry.
+Each history fetch pulls at most 300 newest chunks per connection per
+direction; the status line reports the retained total ("newest K of N").
 
 ## Wire protocol
 

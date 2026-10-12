@@ -95,8 +95,7 @@ class RawTcpPanelTest {
     }
 
     @Test
-    void repeaterTabFollowsConnection() throws Exception {
-        FakeControlPlane fake = new FakeControlPlane();
+    void repeaterTabFollowsConnection() throws Exception {        FakeControlPlane fake = new FakeControlPlane();
         AtomicReference<RawTcpPanel> ref = new AtomicReference<>();
         onEdt(() -> ref.set(new RawTcpPanel(fake, SettingsStore.IN_MEMORY)));
         try {
@@ -169,6 +168,102 @@ class RawTcpPanelTest {
                 assertFalse(ref.get().interceptPanel().controlsEnabled(),
                         "a callback queued before disconnect must not re-enable controls");
             });
+        } finally {
+            onEdt(() -> ref.get().dispose());
+        }
+    }
+
+    private static BurpTcp.HelloAck ackWithSocks(String epoch, String socks) {
+        return BurpTcp.HelloAck.newBuilder()
+                .setProtocolVersion(1)
+                .setDaemonEpoch(epoch)
+                .setServerVersion("test")
+                .setSocksAddr(socks)
+                .build();
+    }
+
+    @Test
+    void bannerSummarizesSetupWhileConnected() throws Exception {
+        FakeControlPlane fake = new FakeControlPlane();
+        fake.listConnectionsResult = CompletableFuture.completedFuture(
+                BurpTcp.ConnectionList.newBuilder()
+                        .addConnections(BurpTcp.ConnectionInfo.newBuilder()
+                                .setConnId("c1").setRequestedHost("10.0.0.9")
+                                .setRequestedPort(7007).setEstablished(true))
+                        .build());
+        fake.statsResult = CompletableFuture.completedFuture(BurpTcp.Stats.newBuilder()
+                .setC2SEnabled(true).setS2CEnabled(false).build());
+        AtomicReference<RawTcpPanel> ref = new AtomicReference<>();
+        onEdt(() -> ref.set(new RawTcpPanel(fake, SettingsStore.IN_MEMORY)));
+        try {
+            onEdt(() -> ref.get().onConnected(ackWithSocks("epoch-123456789", "127.0.0.1:1080")));
+            flush();
+            flush();
+            onEdt(() -> {
+                String banner = ref.get().bannerText();
+                assertTrue(banner.contains("epoch-12"), "banner shows engine epoch: " + banner);
+                assertTrue(banner.contains("127.0.0.1:1080"), "banner shows proxy address: " + banner);
+                assertTrue(banner.contains("to server ON"), "banner shows policy: " + banner);
+                assertTrue(banner.contains("to client off"), "banner shows policy: " + banner);
+                assertTrue(banner.contains("1 live"), "banner shows live count: " + banner);
+                assertTrue(!banner.contains("NOT CONNECTED"), "connected banner is not alarming: " + banner);
+            });
+        } finally {
+            onEdt(() -> ref.get().dispose());
+        }
+    }
+
+    @Test
+    void bannerScreamsWhenDisconnected() throws Exception {
+        FakeControlPlane fake = new FakeControlPlane();
+        AtomicReference<RawTcpPanel> ref = new AtomicReference<>();
+        onEdt(() -> ref.set(new RawTcpPanel(fake, SettingsStore.IN_MEMORY)));
+        try {
+            onEdt(() -> ref.get().onDisconnected("handshake rejected: bad capability token"));
+            flush();
+            onEdt(() -> {
+                String banner = ref.get().bannerText();
+                assertTrue(banner.contains("NOT CONNECTED"), "got: " + banner);
+                assertTrue(banner.contains("bad capability token"), "got: " + banner);
+            });
+        } finally {
+            onEdt(() -> ref.get().dispose());
+        }
+    }
+
+    @Test
+    void connectButtonReconnectsWhenStartedButSocketDead() throws Exception {
+        FakeControlPlane fake = new FakeControlPlane();
+        SettingsStore settings = new SettingsStore() {
+            private final java.util.Map<String, String> values = new java.util.HashMap<>();
+
+            @Override
+            public String get(String key, String fallback) {
+                return values.getOrDefault(key, fallback);
+            }
+
+            @Override
+            public void put(String key, String value) {
+                values.put(key, value);
+            }
+        };
+        settings.put("rawtcp.ipc.port", "1234");
+        settings.put("rawtcp.ipc.token", "fresh-token");
+        AtomicReference<RawTcpPanel> ref = new AtomicReference<>();
+        onEdt(() -> ref.set(new RawTcpPanel(fake, settings)));
+        try {
+            onEdt(() -> ref.get().toggleConnection());
+            onEdt(() -> assertTrue(ref.get().isStarted()));
+            assertEquals(1, fake.startCalls);
+
+            // The socket died (engine restarted) while the session is
+            // started: one press reconnects with the current fields instead
+            // of toggling into a full disconnect.
+            fake.connectedOverride = false;
+            onEdt(() -> ref.get().toggleConnection());
+            onEdt(() -> assertTrue(ref.get().isStarted(),
+                    "reconnect must keep the session started"));
+            assertEquals(2, fake.startCalls, "reconnect must start a fresh loop");
         } finally {
             onEdt(() -> ref.get().dispose());
         }

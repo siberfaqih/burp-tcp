@@ -72,6 +72,7 @@ message HelloAck {
   uint32 protocol_version = 1;
   string daemon_epoch = 2;       // UUID, fresh per engine start
   string server_version = 3;
+  string socks_addr = 4;         // engine SOCKS listener, e.g. "127.0.0.1:1080"
 }
 
 message Error {
@@ -86,6 +87,7 @@ message ListConnections {}
 message HistorySnapshot {
   string conn_id = 1;
   Direction direction = 2;       // UNSPECIFIED = both directions
+  uint32 max_chunks = 3;         // 0 = all; otherwise newest N chunks only
 }
 
 message PendingUnits {}
@@ -161,6 +163,7 @@ message ConnectionInfo {
   bool closed = 5;
   uint64 bytes_client_to_server = 6;
   uint64 bytes_server_to_client = 7;
+  string close_reason = 8;       // terminal reason once closed, "" while live
 }
 message ConnectionList {
   repeated ConnectionInfo connections = 1;
@@ -177,6 +180,7 @@ message TrafficChunkInfo {
 }
 message HistoryData {
   repeated TrafficChunkInfo chunks = 1;
+  uint64 total_chunks = 2;       // chunks retained before max_chunks truncation
 }
 
 message PendingUnitInfo {

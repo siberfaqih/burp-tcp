@@ -16,7 +16,7 @@ public interface ControlPlane {
     CompletableFuture<BurpTcp.ConnectionList> listConnections();
 
     CompletableFuture<BurpTcp.HistoryData> historySnapshot(
-            String connId, BurpTcp.Direction direction);
+            String connId, BurpTcp.Direction direction, int maxChunks);
 
     CompletableFuture<BurpTcp.PendingList> pendingUnits();
 

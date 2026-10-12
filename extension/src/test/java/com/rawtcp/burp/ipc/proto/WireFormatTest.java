@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Golden wire-format tests. The byte sequences asserted here are identical
@@ -76,8 +77,29 @@ class WireFormatTest {
     }
 
     @Test
-    void repeaterSendWireFormatIsStable() {
-        BurpTcp.RepeaterSend send = BurpTcp.RepeaterSend.newBuilder()
+    void connectionInfoCloseReasonWireFormatIsStable() {
+        // New additive fields encode exactly as protoc does: field 8
+        // (close_reason) is tag 0x42. Empty fields are omitted, so old
+        // binaries see identical bytes for live connections.
+        BurpTcp.ConnectionInfo live = BurpTcp.ConnectionInfo.newBuilder()
+                .setConnId("c")
+                .setEstablished(true)
+                .build();
+        byte[] liveBytes = live.toByteArray();
+        for (byte b : liveBytes) {
+            assertTrue(b != 0x42, "empty close_reason must be omitted");
+        }
+        BurpTcp.ConnectionInfo dead = live.toBuilder().setCloseReason("eof").build();
+        byte[] deadBytes = dead.toByteArray();
+        assertEquals(liveBytes.length + 5, deadBytes.length);
+        byte[] tail = {0x42, 0x03, 'e', 'o', 'f'};
+        for (int i = 0; i < tail.length; i++) {
+            assertEquals(tail[i], deadBytes[liveBytes.length + i]);
+        }
+    }
+
+    @Test
+    void repeaterSendWireFormatIsStable() {        BurpTcp.RepeaterSend send = BurpTcp.RepeaterSend.newBuilder()
                 .setDestinationHost("h")
                 .setDestinationPort(7)
                 .setPayload(ByteString.copyFrom(new byte[] {0x01}))

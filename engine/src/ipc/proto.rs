@@ -69,6 +69,10 @@ pub struct HelloAck {
     pub daemon_epoch: String,
     #[prost(string, tag = "3")]
     pub server_version: String,
+    /// Engine SOCKS listener address (e.g. "127.0.0.1:1080") so the
+    /// control plane can show which proxy endpoint the app must use.
+    #[prost(string, tag = "4")]
+    pub socks_addr: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -90,6 +94,11 @@ pub struct HistorySnapshot {
     pub conn_id: String,
     #[prost(enumeration = "Direction", tag = "2")]
     pub direction: i32,
+    /// 0 = all chunks; otherwise only the newest N are returned and
+    /// [`HistoryData::total_chunks`] reports the retained count. Bounds
+    /// snapshot cost so a bulk transfer cannot wedge the control plane.
+    #[prost(uint32, tag = "3")]
+    pub max_chunks: u32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -196,6 +205,9 @@ pub struct ConnectionInfo {
     pub bytes_client_to_server: u64,
     #[prost(uint64, tag = "7")]
     pub bytes_server_to_client: u64,
+    /// Terminal reason once closed (e.g. "eof"); "" while live.
+    #[prost(string, tag = "8")]
+    pub close_reason: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -226,6 +238,9 @@ pub struct TrafficChunkInfo {
 pub struct HistoryData {
     #[prost(message, repeated, tag = "1")]
     pub chunks: Vec<TrafficChunkInfo>,
+    /// Chunks retained for this query before `max_chunks` truncation.
+    #[prost(uint64, tag = "2")]
+    pub total_chunks: u64,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -492,6 +507,7 @@ mod tests {
                     protocol_version: 1,
                     daemon_epoch: String::new(),
                     server_version: String::new(),
+                    socks_addr: String::new(),
                 })),
             })),
         };
@@ -525,6 +541,38 @@ mod tests {
             0x38, 0x04, // idle_timeout_ms = 4
         ];
         assert_eq!(send.encode_to_vec(), expected);
+    }
+
+    #[test]
+    fn connection_info_close_reason_wire_format_is_stable() {
+        // New additive fields must encode exactly as protoc does: field 8
+        // (close_reason) is tag 0x42. Empty fields are omitted entirely, so
+        // old binaries see identical bytes for live connections.
+        let live = ConnectionInfo {
+            conn_id: "c".to_string(),
+            requested_host: String::new(),
+            requested_port: 0,
+            established: true,
+            closed: false,
+            bytes_client_to_server: 0,
+            bytes_server_to_client: 0,
+            close_reason: String::new(),
+        };
+        let live_bytes = live.encode_to_vec();
+        assert!(
+            !live_bytes.contains(&0x42),
+            "empty close_reason must be omitted: {live_bytes:?}"
+        );
+        let dead = ConnectionInfo {
+            close_reason: "eof".to_string(),
+            ..live.clone()
+        };
+        let dead_bytes = dead.encode_to_vec();
+        assert_eq!(
+            &dead_bytes[live_bytes.len()..],
+            &[0x42, 0x03, b'e', b'o', b'f'],
+            "close_reason must append as field 8"
+        );
     }
 
     #[test]

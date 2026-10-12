@@ -73,6 +73,10 @@ async fn connect_and_handshake(
                 Some(proto::ResponseBody::HelloAck(ack)) => {
                     assert_eq!(ack.protocol_version, PROTOCOL_VERSION);
                     assert!(!ack.daemon_epoch.is_empty());
+                    assert!(
+                        !ack.socks_addr.is_empty(),
+                        "HelloAck must name the SOCKS endpoint for setup"
+                    );
                 }
                 other => panic!("expected HelloAck, got {other:?}"),
             }
@@ -144,7 +148,7 @@ impl IpcHarness {
     }
 }
 
-/// 1. A wrong token is rejected: the socket closes without a HelloAck.
+/// 1. A wrong token is rejected with an explicit error naming the token.
 #[tokio::test]
 async fn wrong_token_is_rejected() {
     let harness = IpcHarness::start().await;
@@ -165,7 +169,34 @@ async fn wrong_token_is_rejected() {
     hello.encode(&mut buf).unwrap();
     ws.send(WsMessage::Binary(buf)).await.unwrap();
 
-    // The server should close the connection without a HelloAck.
+    // The server answers with an explicit rejection naming the token, so
+    // the control plane can tell the operator to paste the fresh one.
+    let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("rejection")
+        .expect("frame")
+        .expect("ws read");
+    let bytes = match frame {
+        WsMessage::Binary(b) => b,
+        other => panic!("expected binary rejection, got {other:?}"),
+    };
+    let msg = ServerMessage::decode(&bytes[..]).expect("decode");
+    match msg.body {
+        Some(ServerMessageBody::Response(resp)) => match resp.body {
+            Some(proto::ResponseBody::Error(error)) => {
+                assert_eq!(error.code, 4401);
+                assert!(
+                    error.message.contains("token"),
+                    "rejection must name the token: {}",
+                    error.message
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        },
+        other => panic!("expected Response, got {other:?}"),
+    }
+
+    // ...then the socket closes without a HelloAck.
     let frame = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     match frame {
         Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) => {}
@@ -370,6 +401,7 @@ async fn history_snapshot_returns_captured_bytes() {
         RequestBody::HistorySnapshot(HistorySnapshot {
             conn_id: conn_id.clone(),
             direction: 1, // CLIENT_TO_SERVER
+            max_chunks: 0,
         }),
     )
     .await;
@@ -394,8 +426,92 @@ async fn history_snapshot_returns_captured_bytes() {
     echo.shutdown().await;
 }
 
-/// 6. StateChanged events arrive when connection count changes, and a
-///    frozen client does not stall the relay.
+/// 5b. HistorySnapshot honors max_chunks (newest first) and reports totals.
+#[tokio::test]
+async fn history_snapshot_truncates_to_newest_chunks() {
+    let harness = IpcHarness::start().await;
+    let echo = testlab::echo_server().await;
+    let mut ws = connect_and_handshake(harness.ipc_addr, &harness.token).await;
+
+    let mut stream = socks_client::connect_through_proxy(
+        harness.relay.local_addr(),
+        Destination::Ip(echo.addr().ip()),
+        echo.addr().port(),
+        GreetingStyle::Single,
+        RequestStyle::Single,
+    )
+    .await
+    .expect("connect");
+    // 20 KiB exceeds the 16 KiB relay buffer, so the client-to-server
+    // stream is deterministically more than one chunk.
+    let payload = vec![0xABu8; 20 * 1024];
+    stream.write_all(&payload).await.expect("write");
+    let mut echoed = vec![0u8; 20 * 1024];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut echoed))
+        .await
+        .expect("echo")
+        .expect("read");
+    assert_eq!(echoed, payload);
+
+    let resp = rpc(&mut ws, 2, RequestBody::ListConnections(ListConnections {})).await;
+    let conn_id = match resp.body {
+        Some(proto::ResponseBody::ConnectionList(cl)) => cl
+            .connections
+            .into_iter()
+            .find(|c| c.established)
+            .map(|c| c.conn_id)
+            .expect("established connection"),
+        other => panic!("expected ConnectionList, got {other:?}"),
+    };
+
+    // Full snapshot first: the retained count is the ground truth.
+    let resp = rpc(
+        &mut ws,
+        3,
+        RequestBody::HistorySnapshot(HistorySnapshot {
+            conn_id: conn_id.clone(),
+            direction: 1, // CLIENT_TO_SERVER
+            max_chunks: 0,
+        }),
+    )
+    .await;
+    let full_total = match resp.body {
+        Some(proto::ResponseBody::HistoryData(hd)) => {
+            assert!(hd.chunks.len() >= 2, "20 KiB cannot fit one 16 KiB read");
+            assert_eq!(hd.total_chunks as usize, hd.chunks.len());
+            hd.total_chunks
+        }
+        other => panic!("expected HistoryData, got {other:?}"),
+    };
+
+    // Truncated snapshot: exactly the newest chunk, with the full total.
+    let resp = rpc(
+        &mut ws,
+        4,
+        RequestBody::HistorySnapshot(HistorySnapshot {
+            conn_id,
+            direction: 1, // CLIENT_TO_SERVER
+            max_chunks: 1,
+        }),
+    )
+    .await;
+    match resp.body {
+        Some(proto::ResponseBody::HistoryData(hd)) => {
+            assert_eq!(hd.chunks.len(), 1);
+            assert_eq!(hd.total_chunks, full_total);
+            let tail = &hd.chunks[0];
+            assert_eq!(
+                tail.offset + tail.len,
+                20 * 1024,
+                "the retained chunk must be the stream tail"
+            );
+        }
+        other => panic!("expected HistoryData, got {other:?}"),
+    }
+
+    harness.relay.shutdown().await;
+    echo.shutdown().await;
+}
 #[tokio::test]
 async fn state_changed_events_arrive_without_stalling_relay() {
     let harness = IpcHarness::start().await;
@@ -573,6 +689,11 @@ async fn closed_session_remains_in_list_connections() {
         }
     };
     assert!(!found_closed.conn_id.is_empty());
+    assert!(
+        !found_closed.close_reason.is_empty(),
+        "closed sessions must report why they ended; got {:?}",
+        found_closed
+    );
 
     // History for the closed session is queryable.
     let resp = rpc(
@@ -581,6 +702,7 @@ async fn closed_session_remains_in_list_connections() {
         RequestBody::HistorySnapshot(HistorySnapshot {
             conn_id: found_closed.conn_id,
             direction: 1, // CLIENT_TO_SERVER
+            max_chunks: 0,
         }),
     )
     .await;
