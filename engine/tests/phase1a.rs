@@ -356,6 +356,57 @@ async fn ipv6_destination_is_rejected() {
     harness.shutdown().await;
 }
 
+/// A domain resolving to both loopback families is dialled over IPv4 only.
+///
+/// `localhost` resolves to `::1` and `127.0.0.1`. With a banner server on
+/// each family sharing one port, the relay must reach the IPv4 server:
+/// Phase 1A rejects IPv6, so resolved IPv6 addresses are never dialled.
+#[tokio::test]
+async fn domain_resolving_to_ipv6_dials_ipv4_only() {
+    let v6 = testlab::server_first_server_on("[::1]:0", b"V6".to_vec()).await;
+    let port = v6.addr().port();
+    let v4 = testlab::server_first_server_on(&format!("127.0.0.1:{port}"), b"V4".to_vec()).await;
+
+    let harness = Harness::start().await;
+    let mut stream = socks_client::connect_through_proxy(
+        harness.proxy,
+        Destination::Domain("localhost".to_owned()),
+        port,
+        GreetingStyle::Single,
+        RequestStyle::Single,
+    )
+    .await
+    .expect("domain connect");
+
+    use tokio::io::AsyncReadExt;
+    let mut banner = [0u8; 2];
+    stream.read_exact(&mut banner).await.expect("banner");
+    assert_eq!(&banner, b"V4", "relay must dial the IPv4 server");
+
+    assert_eq!(v6.accepted(), 0, "IPv6 server must see no connection");
+    assert_eq!(v4.accepted(), 1, "IPv4 server must see the connection");
+
+    let events = harness.telemetry.events();
+    let established = events
+        .iter()
+        .find(|event| matches!(event, Event::ConnectionEstablished { .. }))
+        .expect("established event");
+    match established {
+        Event::ConnectionEstablished {
+            resolved_upstream, ..
+        } => match resolved_upstream {
+            Some(addr) => assert!(addr.is_ipv4(), "resolved upstream must be IPv4, got {addr}"),
+            None => panic!("resolved endpoint must be logged"),
+        },
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    drop(stream);
+    harness.shutdown().await;
+    v6.shutdown().await;
+    v4.shutdown().await;
+}
+
 /// A zero-length domain is treated as malformed.
 #[tokio::test]
 async fn zero_length_domain_is_rejected() {
@@ -1232,14 +1283,19 @@ async fn rejected_sessions_log_connection_metadata() {
 /// A fatal error in one direction cancels the other one instead of pinning the
 /// session.
 ///
-/// The server stays silent forever, so the server-to-client direction would
-/// block indefinitely. The client resets mid-stream, which fails the
-/// client-to-server direction; the session must still finish and release its
-/// slot.
+/// The server reads the client's bytes, confirms receipt, then stays silent
+/// forever, so the server-to-client direction would block indefinitely. The
+/// client resets mid-stream, which fails the client-to-server direction; the
+/// session must still finish and release its slot.
+///
+/// Waiting for the fixture's receipt before resetting makes the forwarded
+/// byte count deterministic: on stacks where a reset discards data the relay
+/// has not consumed yet, resetting immediately races the relay's read loop
+/// and the counter may legitimately be zero.
 #[tokio::test]
 async fn relay_error_cancels_blocked_peer() {
     let harness = Harness::start().await;
-    let silent = testlab::silent_server(Duration::from_secs(30)).await;
+    let silent = testlab::read_then_silent_server(b"doomed".len() as u64).await;
 
     let mut stream = socks_client::connect_through_proxy(
         harness.proxy,
@@ -1252,6 +1308,12 @@ async fn relay_error_cancels_blocked_peer() {
     .expect("connect");
 
     stream.write_all(b"doomed").await.expect("write");
+
+    // Only reset once the fixture confirms receipt: the relay necessarily
+    // forwarded all six bytes, so the counter below is exact on every stack.
+    tokio::time::timeout(Duration::from_secs(5), silent.wait_received())
+        .await
+        .expect("fixture must receive the client bytes");
 
     // Reset instead of closing so the relay observes an error, not EOF.
     // (`std`'s `set_linger` is still unstable, so this goes through socket2.)
@@ -1399,11 +1461,16 @@ async fn aborted_relay_cannot_forward_after_cleanup() {
 
     // Never signalled: this test exercises task abort, not the shutdown flag.
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let observer = rawtcp_engine::SessionObserver::new(
+        std::sync::Arc::new(rawtcp_engine::MemoryHistory::default()),
+        "aborted-relay-probe".to_owned(),
+    );
     let relay_task = tokio::spawn(rawtcp_engine::transport::relay(
         relay_client,
         relay_server,
         16 * 1024,
         shutdown_rx,
+        observer,
     ));
 
     // Prove forwarding is active before the abort.
@@ -1552,15 +1619,28 @@ async fn listener_is_closed_before_draining_sessions() {
     );
     assert_eq!(registry.active(), 0);
 
-    // After shutdown completes, new connects fail promptly (refused, not hang).
-    let after = tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::net::TcpStream::connect(proxy),
-    )
-    .await
-    .expect("post-shutdown connect must resolve instead of hanging");
+    // After shutdown completes, new connects must fail (refused, not accepted).
+    // Retried: a host packet interceptor can drop the first SYN of a fresh
+    // flow, delaying the refusal past a single short timeout. A listener that
+    // is still open accepts promptly, so success fails fast on every attempt.
+    let mut refused = false;
+    for _ in 0..4 {
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::net::TcpStream::connect(proxy),
+        )
+        .await
+        {
+            Ok(Err(_)) => {
+                refused = true;
+                break;
+            }
+            Ok(Ok(_)) => panic!("listener must refuse new connections after shutdown"),
+            Err(_) => continue,
+        }
+    }
     assert!(
-        after.is_err(),
+        refused,
         "listener must refuse new connections after shutdown"
     );
 

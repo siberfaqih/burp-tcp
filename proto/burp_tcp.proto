@@ -1,0 +1,286 @@
+syntax = "proto3";
+
+package burptcp.v1;
+
+// Java codegen options (Phase 4B). These affect only generated Java class
+// names/package; they do not change the wire format, field numbers, or
+// oneof layout, so the Rust `prost::Message` structs in
+// engine/src/ipc/proto.rs remain wire-compatible.
+option java_package = "com.rawtcp.burp.ipc.proto";
+option java_outer_classname = "BurpTcp";
+
+// Burp Raw TCP IPC wire protocol (Phase 4A).
+//
+// Transport: binary WebSocket on 127.0.0.1. Each WebSocket binary frame
+// carries exactly one raw protobuf message (no length prefix; the
+// WebSocket frame itself provides message delimitation): a ClientMessage
+// from the client, or a ServerMessage from the server.
+//
+// Auth: the first ClientMessage MUST be a Request whose `hello` field
+// carries the per-launch capability token printed by the engine at
+// startup. A mismatch closes the socket.
+//
+// This file is the canonical schema. The Rust server mirrors it with
+// hand-written prost::Message structs in engine/src/ipc.rs; the Java
+// extension (Phase 4B) compiles it with protoc. The two MUST stay in
+// sync: field names, tag numbers, and oneof layout identical.
+
+// --- Enums ---
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  CLIENT_TO_SERVER = 1;
+  SERVER_TO_CLIENT = 2;
+}
+
+enum InterceptActionKind {
+  ACTION_UNSPECIFIED = 0;
+  FORWARD = 1;
+  REPLACE = 2;
+  SUPPRESS = 3;
+  CLOSE = 4;
+}
+
+enum RepeaterCompletion {
+  REPEATER_COMPLETION_UNSPECIFIED = 0;
+  READ_UNTIL_CLOSE = 1;
+  READ_EXACT_BYTES = 2;
+  READ_UNTIL_IDLE = 3;
+}
+
+enum RepeaterOutcome {
+  REPEATER_OUTCOME_UNSPECIFIED = 0;
+  COMPLETED_CLOSED = 1;
+  COMPLETED_BYTE_COUNT = 2;
+  COMPLETED_IDLE_TIMEOUT = 3;
+  STOPPED = 4;
+  TIMED_OUT = 5;
+  TRUNCATED = 6;
+  FAILED = 7;
+}
+
+// --- Handshake ---
+
+message Hello {
+  uint32 protocol_version = 1;   // must equal 1
+  string client_name = 2;
+  string client_version = 3;
+  string capability_token = 4;   // per-launch token printed by the engine
+}
+
+message HelloAck {
+  uint32 protocol_version = 1;
+  string daemon_epoch = 2;       // UUID, fresh per engine start
+  string server_version = 3;
+}
+
+message Error {
+  uint32 code = 1;
+  string message = 2;
+}
+
+// --- RPCs (request body types) ---
+
+message ListConnections {}
+
+message HistorySnapshot {
+  string conn_id = 1;
+  Direction direction = 2;       // UNSPECIFIED = both directions
+}
+
+message PendingUnits {}
+
+message Decide {
+  string unit_id = 1;
+  uint64 revision = 2;
+  InterceptActionKind action = 3;
+  bytes replace_bytes = 4;       // only for REPLACE
+}
+
+message SetEnabled {
+  Direction direction = 1;
+  bool enabled = 2;
+}
+
+message GetStats {}
+
+message Subscribe {
+  bool state_changes = 1;        // reserved; events are unconditional in v1
+}
+
+// A manual TCP repeater operation (Phase 5). Each `RepeaterSend` performs one
+// explicitly approved send on a fresh TCP session: exactly one dial attempt
+// to one pinned address, one payload write, and one bounded response capture.
+// There are no automatic retries and no repeat of a completed send.
+//
+// One repeater operation may be active per IPC connection. `RepeaterSend`
+// validates the request and starts the operation asynchronously; the client
+// polls `RepeaterStatus` for completion and may request cancellation with
+// `RepeaterStop`. A finished result is retained until replaced by the next
+// operation on the same connection.
+message RepeaterSend {
+  string destination_host = 1;   // IPv4 literal or DNS name; IPv6 rejected
+  uint32 destination_port = 2;   // 1..65535
+  bytes payload = 3;             // written exactly once; may be empty
+  uint32 response_byte_limit = 4;// response cap and, for READ_EXACT_BYTES, count
+  uint64 timeout_ms = 5;         // overall dial + send + receive deadline
+  RepeaterCompletion completion = 6;
+  uint64 idle_timeout_ms = 7;    // required for READ_UNTIL_IDLE, else zero
+}
+
+message RepeaterStartResult {
+  string send_id = 1;            // opaque UUID; required for stop/status
+}
+
+message RepeaterStop {
+  string send_id = 1;
+}
+
+message RepeaterStopResult {
+  string send_id = 1;
+  bool accepted = 2;             // false when the operation already finished
+}
+
+message RepeaterStatus {
+  string send_id = 1;
+}
+
+message RepeaterStatusResult {
+  string send_id = 1;
+  bool finished = 2;
+  RepeaterResult result = 3;     // present only when finished
+}
+
+// --- RPC responses ---
+
+message ConnectionInfo {
+  string conn_id = 1;
+  string requested_host = 2;     // "" if not yet known
+  uint32 requested_port = 3;
+  bool established = 4;
+  bool closed = 5;
+  uint64 bytes_client_to_server = 6;
+  uint64 bytes_server_to_client = 7;
+}
+message ConnectionList {
+  repeated ConnectionInfo connections = 1;
+}
+
+message TrafficChunkInfo {
+  string chunk_id = 1;
+  uint64 seq = 2;
+  uint64 offset = 3;
+  uint64 len = 4;                // length of `bytes`
+  bytes bytes = 5;               // raw bytes (bounded by history limit)
+  uint64 recorded_unix_ms = 6;
+  Direction direction = 7;       // which stream this chunk belongs to
+}
+message HistoryData {
+  repeated TrafficChunkInfo chunks = 1;
+}
+
+message PendingUnitInfo {
+  string unit_id = 1;
+  string conn_id = 2;
+  Direction direction = 3;
+  uint64 seq = 4;
+  uint64 offset = 5;
+  uint64 len = 6;                // length of `bytes`
+  bytes bytes = 7;               // original bytes held for the control plane
+  uint64 revision = 8;
+  uint64 expires_unix_ms = 9;
+}
+message PendingList {
+  repeated PendingUnitInfo units = 1;
+}
+
+message DecideResult {
+  bool committed = 1;
+  string error_kind = 2;         // "" | "unknown_unit" | "stale_revision" | "replace_too_large"
+  uint64 expected_revision = 3;  // for stale_revision
+}
+
+message SetEnabledResult {
+  uint64 released = 1;
+}
+
+message RepeaterResult {
+  string send_id = 1;
+  bool sent = 2;                 // true only when the full payload was written
+  uint64 bytes_sent = 3;         // payload bytes accepted before stop/failure
+  bytes response = 4;            // bounded by response_byte_limit
+  bool response_truncated = 5;   // true when the cap stopped capture early
+  RepeaterOutcome outcome = 6;
+  uint64 elapsed_ms = 7;
+  string error_kind = 8;         // "" unless outcome is FAILED or STOPPED
+}
+
+message Stats {
+  uint64 offers = 1;
+  uint64 overflow_forwards = 2;
+  uint64 lease_releases = 3;
+  uint64 disable_releases = 4;
+  uint64 abandoned = 5;
+  uint64 commits = 6;
+  bool c2s_enabled = 7;
+  bool s2c_enabled = 8;
+  uint64 ipc_dropped_events = 9;
+}
+
+// --- Envelopes ---
+
+message Request {
+  uint32 request_id = 1;         // client-assigned, must be > 0
+  oneof body {
+    Hello hello = 2;
+    ListConnections list_connections = 3;
+    HistorySnapshot history_snapshot = 4;
+    PendingUnits pending_units = 5;
+    Decide decide = 6;
+    SetEnabled set_enabled = 7;
+    GetStats get_stats = 8;
+    Subscribe subscribe = 9;
+    RepeaterSend repeater_send = 10;
+    RepeaterStop repeater_stop = 11;
+    RepeaterStatus repeater_status = 12;
+  }
+}
+
+message Response {
+  uint32 request_id = 1;
+  oneof body {
+    HelloAck hello_ack = 2;
+    ConnectionList connection_list = 3;
+    HistoryData history_data = 4;
+    PendingList pending_list = 5;
+    DecideResult decide_result = 6;
+    SetEnabledResult set_enabled_result = 7;
+    Stats stats = 8;
+    Error error = 9;
+    RepeaterStartResult repeater_start_result = 10;
+    RepeaterStopResult repeater_stop_result = 11;
+    RepeaterStatusResult repeater_status_result = 12;
+  }
+}
+
+message StateChanged {
+  uint64 connection_count = 1;
+  uint64 pending_count = 2;
+}
+
+message Event {
+  uint64 seq = 1;                // monotonic per server, starts at 1
+  uint64 timestamp_unix_ms = 2;
+  StateChanged state_changed = 3;
+}
+
+message ClientMessage {
+  Request request = 1;
+}
+
+message ServerMessage {
+  oneof body {
+    Response response = 1;
+    Event event = 2;
+  }
+}

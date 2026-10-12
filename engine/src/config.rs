@@ -8,6 +8,9 @@ use std::fmt;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use crate::history::HistoryLimits;
+use crate::intercept::InterceptLimits;
+
 /// Default listener endpoint.
 pub const DEFAULT_BIND: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 /// Default SOCKS5 listener port.
@@ -36,6 +39,18 @@ pub struct RelayConfig {
     pub max_connections: usize,
     /// Per-direction relay buffer size.
     pub buffer_bytes: usize,
+    /// Bounds for passive capture history (Phase 2).
+    pub history_limits: HistoryLimits,
+    /// Bounds and hold-lease policy for manual interception (Phase 3).
+    pub intercept_limits: InterceptLimits,
+    /// IPC server port for the Burp control plane (Phase 4A). `None`
+    /// disables the IPC server (default); `Some(0)` binds an ephemeral
+    /// port; `Some(n)` binds `127.0.0.1:n`.
+    pub ipc_port: Option<u16>,
+    /// Per-client event channel capacity for the IPC server. A full
+    /// channel drops events (counted in `ipc_dropped_events`). Default
+    /// 64; tests may use a smaller value for deterministic saturation.
+    pub ipc_event_capacity: usize,
 }
 
 impl Default for RelayConfig {
@@ -47,6 +62,10 @@ impl Default for RelayConfig {
             negotiation_timeout: DEFAULT_NEGOTIATION_TIMEOUT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             buffer_bytes: DEFAULT_BUFFER_BYTES,
+            history_limits: HistoryLimits::default(),
+            intercept_limits: InterceptLimits::default(),
+            ipc_port: None,
+            ipc_event_capacity: 64,
         }
     }
 }
@@ -88,6 +107,34 @@ impl RelayConfig {
         self
     }
 
+    /// Set the bounds for passive capture history (Phase 2).
+    pub fn with_history_limits(mut self, limits: HistoryLimits) -> Self {
+        self.history_limits = limits;
+        self
+    }
+
+    /// Set the bounds and hold-lease policy for manual interception
+    /// (Phase 3).
+    pub fn with_intercept_limits(mut self, limits: InterceptLimits) -> Self {
+        self.intercept_limits = limits;
+        self
+    }
+
+    /// Enable the IPC server on `127.0.0.1:port` (0 = ephemeral). The
+    /// capability token and resolved address are available via
+    /// [`crate::RunningRelay::ipc`].
+    pub fn with_ipc_port(mut self, port: u16) -> Self {
+        self.ipc_port = Some(port);
+        self
+    }
+
+    /// Set the per-client event channel capacity (default 64). A smaller
+    /// value makes event saturation deterministic in tests.
+    pub fn with_ipc_event_capacity(mut self, capacity: usize) -> Self {
+        self.ipc_event_capacity = capacity;
+        self
+    }
+
     /// Reject configurations that cannot be served safely.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.max_connections == 0 {
@@ -101,6 +148,21 @@ impl RelayConfig {
         }
         if self.connect_timeout.is_zero() {
             return Err(ConfigError::ZeroConnectTimeout);
+        }
+        if self.history_limits.max_events == 0
+            || self.history_limits.max_bytes == 0
+            || self.history_limits.max_connections == 0
+        {
+            return Err(ConfigError::ZeroHistoryLimit);
+        }
+        if self.intercept_limits.max_pending == 0 {
+            return Err(ConfigError::ZeroInterceptLimit);
+        }
+        if self.intercept_limits.hold_lease.is_zero() {
+            return Err(ConfigError::ZeroHoldLease);
+        }
+        if self.intercept_limits.max_replace_bytes == 0 {
+            return Err(ConfigError::ZeroMaxReplaceBytes);
         }
         if !self.is_loopback() {
             return Err(ConfigError::NonLoopbackBind {
@@ -123,6 +185,19 @@ pub enum ConfigError {
     ZeroBufferBytes,
     ZeroNegotiationTimeout,
     ZeroConnectTimeout,
+    /// A history bound is zero, which would record nothing yet still pay
+    /// the observation cost. Phase 2 history is always bounded and active.
+    ZeroHistoryLimit,
+    /// An interception bound is zero: the pending queue could hold
+    /// nothing, or the hold lease would expire instantly.
+    ZeroInterceptLimit,
+    /// The interception hold lease is zero.
+    ZeroHoldLease,
+    /// The interception replacement-payload bound is zero: `decide()`
+    /// rejects a `Replace` when its length exceeds the limit, so every
+    /// nonempty replacement would be rejected. At least 1 keeps the
+    /// action usable for nonempty payloads.
+    ZeroMaxReplaceBytes,
     /// Phase 1A only serves loopback clients.
     NonLoopbackBind {
         addr: IpAddr,
@@ -138,6 +213,14 @@ impl fmt::Display for ConfigError {
                 f.write_str("negotiation_timeout must be greater than zero")
             }
             Self::ZeroConnectTimeout => f.write_str("connect_timeout must be greater than zero"),
+            Self::ZeroHistoryLimit => f.write_str(
+                "history limits (max_events, max_bytes, max_connections) must all be at least 1",
+            ),
+            Self::ZeroInterceptLimit => f.write_str("intercept max_pending must be at least 1"),
+            Self::ZeroHoldLease => f.write_str("intercept hold_lease must be greater than zero"),
+            Self::ZeroMaxReplaceBytes => {
+                f.write_str("intercept max_replace_bytes must be greater than zero")
+            }
             Self::NonLoopbackBind { addr } => {
                 write!(f, "Phase 1A binds loopback only; refusing to bind {addr}")
             }

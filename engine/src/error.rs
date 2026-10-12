@@ -110,6 +110,8 @@ pub enum ServeError {
     Bind { addr: String, source: io::Error },
     /// Listener bind address could not be queried.
     LocalAddr(io::Error),
+    /// IPC (WebSocket control-plane) listener could not bind.
+    IpcBind { addr: String, source: io::Error },
 }
 
 impl std::fmt::Display for ServeError {
@@ -119,6 +121,9 @@ impl std::fmt::Display for ServeError {
                 write!(f, "cannot bind SOCKS5 listener on {addr}: {source}")
             }
             Self::LocalAddr(source) => write!(f, "cannot query listener address: {source}"),
+            Self::IpcBind { addr, source } => {
+                write!(f, "cannot bind IPC listener on {addr}: {source}")
+            }
         }
     }
 }

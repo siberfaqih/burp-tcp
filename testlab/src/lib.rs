@@ -6,8 +6,9 @@ pub mod payloads;
 pub mod socks_client;
 
 pub use fixtures::{
-    echo_server, flood_server, half_close_server, login_server, recording_half_close_server,
-    refused_endpoint, server_first_server, silent_server, Fixture, RecordingServer,
+    echo_server, flood_server, half_close_server, login_server, read_then_silent_server,
+    recording_half_close_server, refused_endpoint, server_first_server, server_first_server_on,
+    silent_server, Fixture, ReadThenSilentServer, RecordingServer,
 };
 pub use payloads::{
     count_nuls, deterministic_payload, AUTH_OK_RESPONSE, BINARY_SAMPLE, LOGIN_REQUEST,

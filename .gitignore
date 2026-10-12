@@ -1,6 +1,9 @@
 # Rust build output
 /target/
 
+# Java/Maven build output (Burp extension)
+/extension/target/
+
 # Clean-room boundary: proprietary and reverse-engineering material stays local.
 /analysis/
 /InterceptSuite Pro/

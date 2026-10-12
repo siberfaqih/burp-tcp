@@ -1,0 +1,104 @@
+name: Build Windows Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # -----------------------------
+      # Rust / rawtcp-engine
+      # -----------------------------
+      - name: Install Rust 1.89
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.89.0 `
+            --profile minimal `
+            --component rustfmt `
+            --component clippy
+
+          rustup default 1.89.0
+
+          rustc --version
+          cargo --version
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --workspace
+
+      - name: Build Windows engine
+        run: cargo build --release --package rawtcp-engine
+
+      # -----------------------------
+      # Java / Burp extension
+      # -----------------------------
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Show Java and Maven versions
+        shell: pwsh
+        run: |
+          java -version
+          mvn -version
+
+      - name: Build and test Burp extension
+        working-directory: extension
+        run: mvn --batch-mode clean verify
+
+      # -----------------------------
+      # Package artifacts
+      # -----------------------------
+      - name: Prepare release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+
+          Copy-Item `
+            "target\release\rawtcp-engine.exe" `
+            "dist\rawtcp-engine.exe"
+
+          Copy-Item `
+            "extension\target\rawtcp-burp-extension-0.1.0.jar" `
+            "dist\rawtcp-burp-extension-0.1.0.jar"
+
+          $engineHash = (Get-FileHash `
+            "dist\rawtcp-engine.exe" `
+            -Algorithm SHA256).Hash.ToLower()
+
+          $extensionHash = (Get-FileHash `
+            "dist\rawtcp-burp-extension-0.1.0.jar" `
+            -Algorithm SHA256).Hash.ToLower()
+
+          "$engineHash  rawtcp-engine.exe" |
+            Out-File -Encoding ascii dist\SHA256SUMS.txt
+
+          "$extensionHash  rawtcp-burp-extension-0.1.0.jar" |
+            Out-File -Encoding ascii -Append dist\SHA256SUMS.txt
+
+          Get-ChildItem dist
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: burp-tcp-windows-x64
+          path: dist/*
+          if-no-files-found: error

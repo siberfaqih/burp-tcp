@@ -1,9 +1,15 @@
 //! Protocol-independent bidirectional TCP relay.
 //!
 //! TCP is a byte stream: a single `read()` may return part of one logical
-//! message or many messages. Nothing here interprets message boundaries. Bytes
-//! are copied verbatim, so arbitrary binary payloads — including `0x00` and
-//! `0xff` — round-trip unchanged.
+//! message or many messages. Nothing here interprets message boundaries. On
+//! the passive path bytes are copied verbatim, so arbitrary binary payloads —
+//! including `0x00` and `0xff` — round-trip unchanged. Phase 3 adds an
+//! **opt-in** interception gate: when a relay is given an
+//! [`InterceptCoordinator`] and a direction is enabled, each read chunk is
+//! offered as a unit, held until the control plane decides
+//! forward/replace/suppress/close, and the decision — not the original bytes —
+//! may then be delivered. The passive path (no coordinator, disabled
+//! direction, or overflow passthrough) performs no editing.
 //!
 //! Three properties matter for correctness:
 //!
@@ -32,8 +38,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 
+use crate::history::{Direction, SessionObserver};
+use crate::intercept::{InterceptAction, InterceptCoordinator, OfferOutcome};
+
 /// Terminal reason recorded for a relayed session.
 pub const REASON_EOF: &str = "eof";
+/// Terminal reason recorded when an interception decision closes the
+/// session (Phase 3).
+pub const REASON_INTERCEPT_CLOSE: &str = "closed by interception decision";
 
 /// Directional byte counters and the terminal reason for a relayed session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +67,8 @@ struct HalfOutcome {
     error: Option<io::Error>,
     /// Whether the engine shutdown cut the direction short.
     cancelled: bool,
+    /// Whether an interception `Close` decision ended the direction.
+    closed_by_decision: bool,
 }
 
 /// Resolve once the engine has been asked to shut down.
@@ -86,11 +100,15 @@ pub async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
 /// Byte counters are owned by the caller through [`relay_with_counters`]: they
 /// are updated as bytes are forwarded and stay readable after this future is
 /// dropped, so a supervisor can still report progress for an aborted session.
+///
+/// `observer` receives every successfully forwarded byte run for passive
+/// Phase 2 history; forwarding itself is unchanged.
 pub async fn relay(
     client: TcpStream,
     server: TcpStream,
     buffer_bytes: usize,
     shutdown: watch::Receiver<bool>,
+    observer: SessionObserver,
 ) -> RelayOutcome {
     relay_with_counters(
         client,
@@ -99,6 +117,8 @@ pub async fn relay(
         shutdown,
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
+        observer,
+        None,
     )
     .await
 }
@@ -109,6 +129,15 @@ pub async fn relay(
 /// destination socket and remain valid after the relay future ends — including
 /// when it is dropped via task abort — so lifecycle accounting can read final
 /// progress for sessions that never returned an outcome.
+///
+/// `intercept` is the Phase 3 manual interception coordinator. `None`
+/// (or a coordinator with both directions disabled) reproduces the
+/// passive Phase 2 relay byte for byte: offers happen only for enabled
+/// directions.
+// Eight parameters is the honest relay shape (two sockets, buffer,
+// shutdown, two counters, observer, coordinator); bundling them would
+// hide which side owns each socket half.
+#[allow(clippy::too_many_arguments)]
 pub async fn relay_with_counters(
     client: TcpStream,
     server: TcpStream,
@@ -116,6 +145,8 @@ pub async fn relay_with_counters(
     shutdown: watch::Receiver<bool>,
     c2s_progress: Arc<AtomicU64>,
     s2c_progress: Arc<AtomicU64>,
+    observer: SessionObserver,
+    intercept: Option<Arc<InterceptCoordinator>>,
 ) -> RelayOutcome {
     let buffer_bytes = buffer_bytes.max(1);
 
@@ -131,6 +162,9 @@ pub async fn relay_with_counters(
         buffer_bytes,
         shutdown.clone(),
         Arc::clone(&c2s_progress),
+        observer.clone(),
+        Direction::ClientToServer,
+        intercept.clone(),
     ));
     let mut s2c_fut = Box::pin(copy_half(
         server_read,
@@ -138,6 +172,9 @@ pub async fn relay_with_counters(
         buffer_bytes,
         shutdown,
         Arc::clone(&s2c_progress),
+        observer,
+        Direction::ServerToClient,
+        intercept,
     ));
 
     let (upstream, downstream) = tokio::select! {
@@ -151,6 +188,7 @@ pub async fn relay_with_counters(
                     bytes: s2c_progress.load(Ordering::Relaxed),
                     error: None,
                     cancelled: false,
+                    closed_by_decision: false,
                 };
                 (upstream, downstream)
             } else {
@@ -166,6 +204,7 @@ pub async fn relay_with_counters(
                     bytes: c2s_progress.load(Ordering::Relaxed),
                     error: None,
                     cancelled: false,
+                    closed_by_decision: false,
                 };
                 (upstream, downstream)
             } else {
@@ -182,8 +221,9 @@ pub async fn relay_with_counters(
     }
 }
 
-/// A direction counts as failed when it errored or was cut short by shutdown.
-/// Clean EOF is not a failure: the reverse direction keeps flowing.
+/// A direction counts as failed when it errored, was cut short by
+/// shutdown, or was closed by an interception decision. Clean EOF is not
+/// a failure: the reverse direction keeps flowing.
 fn is_failure(outcome: Option<&HalfOutcome>) -> bool {
     matches!(
         outcome,
@@ -192,14 +232,22 @@ fn is_failure(outcome: Option<&HalfOutcome>) -> bool {
                 cancelled: true,
                 ..
             })
+            | Some(HalfOutcome {
+                closed_by_decision: true,
+                ..
+            })
     )
 }
 
-/// Terminal reason for a finished relay: shutdown wins over transport errors,
-/// and a lone transport error names its direction.
+/// Terminal reason for a finished relay: shutdown wins over interception
+/// closes, interception closes over transport errors, and a lone
+/// transport error names its direction.
 fn terminal_reason(upstream: &HalfOutcome, downstream: &HalfOutcome) -> String {
     if upstream.cancelled || downstream.cancelled {
         return "engine shutdown".to_owned();
+    }
+    if upstream.closed_by_decision || downstream.closed_by_decision {
+        return REASON_INTERCEPT_CLOSE.to_owned();
     }
 
     match (&upstream.error, &downstream.error) {
@@ -219,12 +267,43 @@ fn terminal_reason(upstream: &HalfOutcome, downstream: &HalfOutcome) -> String {
 /// write is accounted for exactly. `progress` mirrors the count into shared
 /// memory so it survives the peer being dropped after a failure in the other
 /// direction.
+///
+/// `observer` receives every byte run the destination accepted, in order, for
+/// passive history. Observation adds synchronous bookkeeping/copying after
+/// each successful write; it does not modify bytes or add network awaits.
+/// The built-in sink drops/counts observations under lock contention rather
+/// than waiting for snapshot readers.
+///
+/// Phase 3: when `intercept` is present and enabled for `direction`, each
+/// read chunk is first offered to the coordinator as a pending unit and
+/// **nothing is delivered until the unit resolves**. The sequential loop
+/// therefore guarantees held bytes can never be overtaken by later
+/// same-direction reads. Resolution is one of:
+///
+/// * `Forward` — deliver the original bytes;
+/// * `Replace` — deliver the replacement bytes instead (history records
+///   what was actually delivered, keeping the Phase 2 contract);
+/// * `Suppress` — deliver nothing and continue;
+/// * `Close` — deliver nothing and tear the session down (the peer
+///   direction is cancelled via the failure path).
+///
+/// Units whose session dies while held (task abort, engine shutdown) are
+/// released by the coordinator's lazy sweep, so the loop never outlives
+/// the session. With interception disabled or absent, this function is
+/// byte-for-byte the Phase 2 copy loop.
+// Eight parameters: reader, writer, buffer, shutdown, counter,
+// observer, direction, coordinator. Each is used exactly once and none
+// belongs to a natural group.
+#[allow(clippy::too_many_arguments)]
 async fn copy_half<R, W>(
     mut reader: R,
     mut writer: W,
     buffer_bytes: usize,
     shutdown: watch::Receiver<bool>,
     progress: Arc<AtomicU64>,
+    observer: SessionObserver,
+    direction: Direction,
+    intercept: Option<Arc<InterceptCoordinator>>,
 ) -> HalfOutcome
 where
     R: AsyncRead + Unpin,
@@ -234,6 +313,12 @@ where
     let mut bytes: u64 = 0;
     let mut error: Option<io::Error> = None;
     let mut cancelled = false;
+    let mut closed_by_decision = false;
+    // Source-read accounting for interception offers: position among
+    // this direction's reads, independent of what history stores (held
+    // bytes may be replaced or suppressed before delivery).
+    let mut source_seq: u64 = 0;
+    let mut source_offset: u64 = 0;
 
     'copy: loop {
         let read = tokio::select! {
@@ -254,15 +339,68 @@ where
             }
         };
 
+        // Offer position in read order; advanced now so every arm below
+        // sees consistent accounting whether the unit is held or not.
+        let (seq, offset) = (source_seq, source_offset);
+        source_seq += 1;
+        source_offset += read as u64;
+
+        // Phase 3 interception gate. A held unit blocks this direction
+        // entirely — by design, and bounded by the finite lease — while
+        // bytes stay in the kernel socket buffer rather than engine
+        // memory. The passive path (`None`/disabled/passthrough/forward)
+        // writes straight out of the read buffer with no extra copy.
+        enum Payload<'a> {
+            Read(&'a [u8]),
+            Replaced(Vec<u8>),
+        }
+        let payload = match &intercept {
+            None => Payload::Read(&buffer[..read]),
+            Some(coordinator) => {
+                match coordinator.offer(observer.conn_id(), direction, seq, offset, &buffer[..read])
+                {
+                    OfferOutcome::Passthrough => Payload::Read(&buffer[..read]),
+                    OfferOutcome::Held(handle) => {
+                        // A held unit still yields to engine shutdown: the
+                        // dropped resolve future drops the receiver, and the
+                        // coordinator's lazy sweep retires the unit, so
+                        // neither the session nor the queue outlives the
+                        // engine.
+                        let action = tokio::select! {
+                            biased;
+                            _ = wait_for_shutdown(shutdown.clone()) => {
+                                cancelled = true;
+                                break 'copy;
+                            }
+                            action = handle.resolve() => action,
+                        };
+                        match action {
+                            InterceptAction::Forward => Payload::Read(&buffer[..read]),
+                            InterceptAction::Replace(replacement) => Payload::Replaced(replacement),
+                            InterceptAction::Suppress => continue 'copy,
+                            InterceptAction::Close => {
+                                closed_by_decision = true;
+                                break 'copy;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let delivered: &[u8] = match &payload {
+            Payload::Read(bytes) => bytes,
+            Payload::Replaced(replacement) => replacement,
+        };
+
         let mut written = 0usize;
-        while written < read {
+        while written < delivered.len() {
             let attempt = tokio::select! {
                 biased;
                 _ = wait_for_shutdown(shutdown.clone()) => {
                     cancelled = true;
                     break 'copy;
                 }
-                result = writer.write(&buffer[written..read]) => result,
+                result = writer.write(&delivered[written..]) => result,
             };
 
             match attempt {
@@ -274,9 +412,14 @@ where
                     break 'copy;
                 }
                 Ok(count) => {
+                    // Counters advance BEFORE observation: if the history
+                    // sink panics, delivered-byte accounting must survive
+                    // even though this session dies with it. (Sink panics
+                    // still propagate, consistent with telemetry sinks.)
                     written += count;
                     bytes += count as u64;
                     progress.fetch_add(count as u64, Ordering::Relaxed);
+                    observer.observe(direction, &delivered[written - count..written]);
                 }
                 Err(failure) => {
                     error = Some(failure);
@@ -294,5 +437,6 @@ where
         bytes,
         error,
         cancelled,
+        closed_by_decision,
     }
 }

@@ -45,9 +45,19 @@ where
     F: Fn(TcpStream) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("fixture bind");
+    spawn_fixture_on("127.0.0.1:0", handler).await
+}
+
+/// [`spawn_fixture`] bound to an explicit address (e.g. `"[::1]:0"`).
+///
+/// Lets tests listen on both loopback families at once; the default helper
+/// stays IPv4-only so existing callers are unaffected.
+async fn spawn_fixture_on<F, Fut>(bind: &str, handler: F) -> Fixture
+where
+    F: Fn(TcpStream) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = TcpListener::bind(bind).await.expect("fixture bind");
     let addr = listener.local_addr().expect("fixture local_addr");
     let accepted = Arc::new(AtomicU64::new(0));
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
@@ -104,31 +114,48 @@ pub async fn echo_server() -> Fixture {
 ///
 /// Proves the relay does not require client-first traffic.
 pub async fn server_first_server(banner: Vec<u8>) -> Fixture {
-    spawn_fixture(move |socket: TcpStream| {
-        let banner = Arc::new(banner.clone());
-        async move {
-            let (mut reader, mut writer) = socket.into_split();
-            if writer.write_all(&banner).await.is_err() {
-                return;
-            }
-            let _ = writer.flush().await;
+    server_first_server_on("127.0.0.1:0", banner).await
+}
 
-            let mut buffer = vec![0u8; 8 * 1024];
-            loop {
-                match reader.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if writer.write_all(&buffer[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+/// [`server_first_server`] bound to an explicit address.
+///
+/// Binding `"[::1]:0"` and `"127.0.0.1:<same-port>"` lets a test offer one
+/// service on both loopback families and prove which family the relay dials.
+pub async fn server_first_server_on(bind: &str, banner: Vec<u8>) -> Fixture {
+    serve_banner(bind, banner).await
+}
+
+/// Shared server-first accept loop used by both address families.
+fn serve_banner(bind: &str, banner: Vec<u8>) -> impl std::future::Future<Output = Fixture> + Send {
+    let banner = Arc::new(banner);
+    let bind = bind.to_owned();
+    async move {
+        spawn_fixture_on(bind.as_str(), move |socket: TcpStream| {
+            let banner = Arc::clone(&banner);
+            async move {
+                let (mut reader, mut writer) = socket.into_split();
+                if writer.write_all(&banner).await.is_err() {
+                    return;
                 }
+                let _ = writer.flush().await;
+
+                let mut buffer = vec![0u8; 8 * 1024];
+                loop {
+                    match reader.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if writer.write_all(&buffer[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = writer.shutdown().await;
             }
-            let _ = writer.shutdown().await;
-        }
-    })
-    .await
+        })
+        .await
+    }
 }
 
 /// Half-close-capable fixture.
@@ -328,6 +355,97 @@ pub async fn silent_server(hold: Duration) -> Fixture {
         drop(socket);
     })
     .await
+}
+
+/// Server that reads an exact byte count, signals receipt, then stays silent.
+///
+/// Unlike [`silent_server`] (which never reads), this fixture lets a test
+/// prove the relay forwarded bytes *before* the client resets: the reset is
+/// only triggered after the fixture confirms receipt, so the relay's
+/// directional counter is deterministic even on stacks where a reset
+/// discards data the relay has not consumed yet. Afterwards it never
+/// writes, so the reverse direction stays blocked exactly as with
+/// [`silent_server`].
+pub struct ReadThenSilentServer {
+    fixture: Fixture,
+    received_bytes: Arc<AtomicU64>,
+    received_all: Arc<AtomicBool>,
+    done: Arc<Notify>,
+}
+
+impl ReadThenSilentServer {
+    /// Bound address, including the ephemeral port.
+    pub fn addr(&self) -> SocketAddr {
+        self.fixture.addr()
+    }
+
+    /// Bytes received so far.
+    pub fn received(&self) -> u64 {
+        self.received_bytes.load(Ordering::SeqCst)
+    }
+
+    /// Resolve once the fixture has read `expected` bytes.
+    ///
+    /// Polls a flag (rather than a bare `notified()`) so a notification that
+    /// fires before the first poll is still observed.
+    pub async fn wait_received(&self) {
+        loop {
+            if self.received_all.load(Ordering::SeqCst) {
+                return;
+            }
+            self.done.notified().await;
+        }
+    }
+
+    /// Stop the fixture and await its listener task.
+    pub async fn shutdown(self) {
+        self.fixture.shutdown().await;
+    }
+}
+
+/// Read `expect_bytes`, then hold the connection open without writing.
+pub async fn read_then_silent_server(expect_bytes: u64) -> ReadThenSilentServer {
+    let received_bytes = Arc::new(AtomicU64::new(0));
+    let received_all = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(Notify::new());
+
+    let bytes_for_handler = Arc::clone(&received_bytes);
+    let all_for_handler = Arc::clone(&received_all);
+    let done_for_handler = Arc::clone(&done);
+    let fixture = spawn_fixture(move |socket: TcpStream| {
+        let received_bytes = Arc::clone(&bytes_for_handler);
+        let received_all = Arc::clone(&all_for_handler);
+        let done = Arc::clone(&done_for_handler);
+        async move {
+            let (mut reader, _writer) = socket.into_split();
+            let mut buffer = vec![0u8; 8 * 1024];
+            loop {
+                match reader.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let total = received_bytes.fetch_add(n as u64, Ordering::SeqCst) + n as u64;
+                        if total >= expect_bytes {
+                            received_all.store(true, Ordering::SeqCst);
+                            done.notify_one();
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Silent hold: never write, so the peer direction blocks until
+            // the relay cancels it. The hold is bounded; shutdown drops it.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    })
+    .await;
+
+    ReadThenSilentServer {
+        fixture,
+        received_bytes,
+        received_all,
+        done,
+    }
 }
 /// socket accepts, ignoring backpressure errors.
 ///

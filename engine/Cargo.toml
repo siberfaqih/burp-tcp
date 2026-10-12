@@ -18,8 +18,13 @@ path = "src/main.rs"
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 uuid = { version = "1", features = ["v4"] }
+prost = "0.13"
+bytes = "1"
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 
 [dev-dependencies]
 testlab = { path = "../testlab" }
 socket2 = "0.6"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+futures-util = "0.3"

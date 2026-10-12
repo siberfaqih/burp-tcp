@@ -52,7 +52,7 @@ async fn resolve(target: &RequestTarget, port: u16) -> Result<Vec<SocketAddr>, S
                             detail: format!("no address returned for {name}"),
                         })
                     } else {
-                        Ok(collected)
+                        retain_ipv4(name, collected)
                     }
                 }
                 Ok(Err(error)) => Err(SocksError::Connect {
@@ -61,6 +61,28 @@ async fn resolve(target: &RequestTarget, port: u16) -> Result<Vec<SocketAddr>, S
                 }),
             }
         }
+    }
+}
+
+/// Keep only the IPv4 candidates from a resolved address list.
+///
+/// Phase 1A rejects IPv6 destinations (`CURRENT_TASK.md`, Negotiation): an
+/// `ATYP_IPV6` literal is answered with `ADDRESS_TYPE_NOT_SUPPORTED`, so an
+/// IPv6 address obtained through resolution must not be dialled either.
+/// Without this, a domain resolving to both families (e.g. `localhost` ->
+/// `::1` + `127.0.0.1`) could establish an IPv6 upstream while IPv6 literals
+/// are refused, and the success reply would carry an IPv6 bound endpoint.
+/// A name resolving solely to IPv6 is rejected with
+/// `ADDRESS_TYPE_NOT_SUPPORTED` rather than dialled.
+fn retain_ipv4(name: &str, addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, SocksError> {
+    let v4: Vec<SocketAddr> = addrs.into_iter().filter(|addr| addr.is_ipv4()).collect();
+    if v4.is_empty() {
+        Err(SocksError::Connect {
+            code: reply::ADDRESS_TYPE_NOT_SUPPORTED,
+            detail: format!("no IPv4 address returned for {name}"),
+        })
+    } else {
+        Ok(v4)
     }
 }
 
@@ -104,4 +126,37 @@ async fn connect_first(
         code: reply::HOST_UNREACHABLE,
         detail: "no upstream address available".into(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn mixed_resolution_keeps_ipv4_candidates_in_order() {
+        let addrs = vec![
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 1433)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 1433)),
+            SocketAddr::from((Ipv4Addr::new(192, 168, 1, 18), 1433)),
+        ];
+        let kept = retain_ipv4("localhost", addrs).expect("IPv4 candidates exist");
+        assert_eq!(
+            kept,
+            vec![
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 1433)),
+                SocketAddr::from((Ipv4Addr::new(192, 168, 1, 18), 1433)),
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv6_only_resolution_is_rejected_as_address_type() {
+        let addrs = vec![
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 1433)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 80)),
+        ];
+        let error = retain_ipv4("v6-only.example", addrs).expect_err("must reject");
+        assert_eq!(error.reply_code(), Some(reply::ADDRESS_TYPE_NOT_SUPPORTED));
+    }
 }

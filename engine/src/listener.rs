@@ -26,6 +26,10 @@ use tokio::task::JoinSet;
 use crate::config::RelayConfig;
 use crate::connection::{Admission, ConnectionRegistry};
 use crate::error::{reply, ServeError, SocksError};
+use crate::history::{
+    ConnectionClose, ConnectionOpen, MemoryHistory, SessionObserver, SharedHistory,
+};
+use crate::intercept::InterceptCoordinator;
 use crate::socks5::greeting::{read_greeting, write_no_acceptable, METHOD_NO_AUTH, SOCKS_VERSION};
 use crate::socks5::reply::write_reply;
 use crate::socks5::request::read_request;
@@ -40,12 +44,24 @@ const UNKNOWN_ADDR: SocketAddr =
 /// sockets before giving up on them.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Cap on grace-drain bytes before a rejection reply is framed.
+///
+/// A SOCKS request tail is at most a domain length byte plus 255 name bytes
+/// plus 2 port bytes; the cap covers that with slack for pipelined junk.
+const REJECT_DRAIN_CAP_BYTES: usize = 512;
+/// Total budget for the grace drain. Loopback clients deliver in-flight
+/// bytes in microseconds; the budget only bounds slow or hostile dribblers.
+const REJECT_DRAIN_BUDGET: Duration = Duration::from_millis(250);
+
 /// Handle to a running relay: bound address plus graceful shutdown.
 pub struct RunningRelay {
     local_addr: SocketAddr,
     shutdown: Option<watch::Sender<bool>>,
     join: Option<tokio::task::JoinHandle<()>>,
     registry: Arc<ConnectionRegistry>,
+    history: Arc<MemoryHistory>,
+    intercept: Arc<InterceptCoordinator>,
+    ipc: Option<crate::ipc::IpcHandle>,
 }
 
 impl RunningRelay {
@@ -59,22 +75,52 @@ impl RunningRelay {
         Arc::clone(&self.registry)
     }
 
+    /// Passive capture history for this relay (Phase 2).
+    pub fn history(&self) -> Arc<MemoryHistory> {
+        Arc::clone(&self.history)
+    }
+
+    /// Manual interception coordinator for this relay (Phase 3).
+    ///
+    /// Both directions are disabled by default; a relay whose control
+    /// plane never enables interception is byte-for-byte the passive
+    /// Phase 2 relay.
+    pub fn intercept(&self) -> Arc<InterceptCoordinator> {
+        Arc::clone(&self.intercept)
+    }
+
+    /// IPC server handle (Phase 4A), if the relay was configured with
+    /// `RelayConfig::ipc_port`. The capability token printed at startup
+    /// must be configured into the control-plane client.
+    pub fn ipc(&self) -> Option<&crate::ipc::IpcHandle> {
+        self.ipc.as_ref()
+    }
+
     /// Ask the engine to stop accepting and to close live sessions.
     ///
-    /// This only raises the shutdown flag. Live sessions observe it and release
-    /// their sockets; use [`RunningRelay::wait_stopped`] to await completion.
+    /// Signals both the SOCKS5 listener and the IPC server. Live
+    /// sessions observe the flag and release their sockets; use
+    /// [`RunningRelay::wait_stopped`] to await completion.
     pub fn begin_shutdown(&self) {
         if let Some(sender) = &self.shutdown {
             sender.send_replace(true);
         }
+        if let Some(ipc) = &self.ipc {
+            ipc.begin_shutdown();
+        }
     }
 
-    /// Await listener and session shutdown.
+    /// Await listener, session, and IPC shutdown.
     ///
-    /// The join handle is only removed after the shutdown task completes, so a
-    /// cancelled or timed-out wait can be retried instead of silently detaching
-    /// the engine task.
+    /// The join handles are only removed after their tasks complete, so a
+    /// cancelled or timed-out wait can be retried instead of silently
+    /// detaching engine tasks.
     pub async fn wait_stopped(&mut self) {
+        // Await the IPC server first so no control-plane connections
+        // remain while the relay drains.
+        if let Some(ipc) = self.ipc.as_mut() {
+            ipc.wait_stopped().await;
+        }
         if let Some(handle) = self.join.as_mut() {
             let _ = handle.await;
         }
@@ -104,7 +150,18 @@ pub async fn serve(
     telemetry.emit(Event::ListenerStarted { local_addr });
 
     let registry = Arc::new(ConnectionRegistry::new(config.max_connections));
-    accept_loop(listener, config, Arc::clone(&telemetry), registry, shutdown).await;
+    let history = Arc::new(MemoryHistory::new(config.history_limits));
+    let intercept = InterceptCoordinator::new(config.intercept_limits);
+    accept_loop(
+        listener,
+        config,
+        Arc::clone(&telemetry),
+        registry,
+        Arc::clone(&history),
+        Arc::clone(&intercept),
+        shutdown,
+    )
+    .await;
     Ok(local_addr)
 }
 
@@ -126,12 +183,42 @@ pub async fn spawn_relay_with(
     telemetry.emit(Event::ListenerStarted { local_addr });
 
     let registry = Arc::new(ConnectionRegistry::new(config.max_connections));
+    let history = Arc::new(MemoryHistory::new(config.history_limits));
+    let intercept = InterceptCoordinator::new(config.intercept_limits);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Start the IPC server if configured. The capability token is
+    // generated inside spawn_ipc; the handle carries it back so the
+    // caller (engine binary or test) can print or assert on it. A bind
+    // failure is propagated, not swallowed: a relay that requested IPC
+    // must not start without it.
+    let ipc = if let Some(ipc_port) = config.ipc_port {
+        let ipc_addr = format!("127.0.0.1:{ipc_port}");
+        Some(
+            crate::ipc::spawn_ipc(
+                ipc_port,
+                config.ipc_event_capacity,
+                Arc::clone(&registry),
+                Arc::clone(&history),
+                Arc::clone(&intercept),
+            )
+            .await
+            .map_err(|source| ServeError::IpcBind {
+                addr: ipc_addr,
+                source,
+            })?,
+        )
+    } else {
+        None
+    };
+
     let join = tokio::spawn(accept_loop(
         listener,
         config,
         Arc::clone(&telemetry),
         Arc::clone(&registry),
+        Arc::clone(&history),
+        Arc::clone(&intercept),
         shutdown_rx,
     ));
 
@@ -140,6 +227,9 @@ pub async fn spawn_relay_with(
         shutdown: Some(shutdown_tx),
         join: Some(join),
         registry,
+        history,
+        intercept,
+        ipc,
     })
 }
 
@@ -162,6 +252,8 @@ async fn accept_loop(
     config: RelayConfig,
     telemetry: SharedTelemetry,
     registry: Arc<ConnectionRegistry>,
+    history: Arc<MemoryHistory>,
+    intercept: Arc<InterceptCoordinator>,
     shutdown: watch::Receiver<bool>,
 ) {
     // Session tasks are tracked so shutdown can drain them instead of
@@ -237,6 +329,8 @@ async fn accept_loop(
                     shutdown.clone(),
                     Arc::clone(&telemetry),
                     Arc::clone(&registry),
+                    Arc::clone(&history),
+                    Arc::clone(&intercept),
                     conn_id.clone(),
                     client_addr,
                 );
@@ -370,6 +464,7 @@ where
 struct SessionFinalizer {
     telemetry: SharedTelemetry,
     registry: Arc<ConnectionRegistry>,
+    history: SharedHistory,
     conn_id: String,
     client_addr: SocketAddr,
     opened_at: Instant,
@@ -386,12 +481,14 @@ impl SessionFinalizer {
     fn new(
         telemetry: SharedTelemetry,
         registry: Arc<ConnectionRegistry>,
+        history: SharedHistory,
         conn_id: String,
         client_addr: SocketAddr,
     ) -> Self {
         Self {
             telemetry,
             registry,
+            history,
             conn_id,
             client_addr,
             opened_at: Instant::now(),
@@ -416,11 +513,22 @@ impl SessionFinalizer {
     /// Transition to forwarding and emit `ConnectionEstablished`.
     ///
     /// State is stored before emitting, so a panicking telemetry sink still
-    /// leaves the guard with full metadata for its terminal record.
+    /// leaves the guard with full metadata for its terminal record. The
+    /// history open record is written first: capture starts exactly when
+    /// forwarding starts, so no forwarded byte predates its connection.
     fn mark_established(&mut self, resolved_upstream: SocketAddr) {
         self.registry.mark_forwarding(&self.conn_id);
         self.established = true;
         self.resolved_upstream = Some(resolved_upstream);
+        self.history.record_connection_open(ConnectionOpen {
+            conn_id: self.conn_id.clone(),
+            requested_target: self
+                .requested_target
+                .clone()
+                .unwrap_or_else(|| String::from("-")),
+            requested_port: self.requested_port.unwrap_or(0),
+            resolved_upstream,
+        });
         self.telemetry.emit(Event::ConnectionEstablished {
             conn_id: self.conn_id.clone(),
             client_addr: self.client_addr,
@@ -442,6 +550,14 @@ impl SessionFinalizer {
     fn report_closed(&mut self, outcome: crate::transport::RelayOutcome) {
         self.reported = true;
         self.registry.close(&self.conn_id);
+        self.history.record_connection_close(
+            &self.conn_id,
+            ConnectionClose {
+                bytes_client_to_server: outcome.bytes_client_to_server,
+                bytes_server_to_client: outcome.bytes_server_to_client,
+                reason: outcome.reason.clone(),
+            },
+        );
         self.telemetry.emit(Event::ConnectionClosed {
             conn_id: self.conn_id.clone(),
             requested_target: self
@@ -470,6 +586,11 @@ impl SessionFinalizer {
     ) {
         if send_reply {
             if let Some(code) = error.reply_code() {
+                // Drain first: closing with pending receive data makes
+                // Windows reset the connection, discarding even the reply
+                // bytes already delivered to the peer, so the client would
+                // observe `ConnectionReset` instead of this failure reply.
+                drain_request_tail(socket).await;
                 let bind_addr = socket.local_addr().unwrap_or(UNKNOWN_ADDR);
                 let _ = write_reply(socket, code, bind_addr).await;
             }
@@ -528,6 +649,22 @@ impl Drop for SessionFinalizer {
                 reason: abnormal.to_owned(),
             }
         };
+        // History close for sessions that never reported through the normal
+        // path. Recorded only for established sessions (rejected ones never
+        // opened a history record). The built-in history enqueues with
+        // try-locks and never waits for metadata snapshots/store locks,
+        // including in this abort/unwind path. Metadata loss is counted.
+        // The telemetry emit below remains guarded against sink panics.
+        if self.established {
+            self.history.record_connection_close(
+                &self.conn_id,
+                ConnectionClose {
+                    bytes_client_to_server: self.bytes_c2s.load(Ordering::Relaxed),
+                    bytes_server_to_client: self.bytes_s2c.load(Ordering::Relaxed),
+                    reason: abnormal.to_owned(),
+                },
+            );
+        }
         // A panicking sink must never escape cleanup: during unwinding this
         // would be a second panic and abort the process. The slot is already
         // released above, so swallowing only loses one log record. Panics on
@@ -552,17 +689,26 @@ impl Drop for SessionFinalizer {
 /// through it, and the lifecycle regressions build theirs through it too, so
 /// the pre-poll guarantee is exercised as shipped rather than re-implemented
 /// inside a test.
+///
+/// Nine parameters is the honest shape of everything a session owns from
+/// creation (socket, config, shutdown, telemetry, registry, history,
+/// interception, ID, peer address); bundling them would hide the
+/// construction order this helper exists to enforce.
+#[allow(clippy::too_many_arguments)]
 fn start_session(
     socket: TcpStream,
     config: RelayConfig,
     shutdown: watch::Receiver<bool>,
     telemetry: SharedTelemetry,
     registry: Arc<ConnectionRegistry>,
+    history: Arc<MemoryHistory>,
+    intercept: Arc<InterceptCoordinator>,
     conn_id: String,
     client_addr: SocketAddr,
 ) -> impl std::future::Future<Output = ()> + Send {
-    let finalizer = SessionFinalizer::new(telemetry, registry, conn_id, client_addr);
-    async move { handle_session(socket, config, shutdown, finalizer).await }
+    let history: SharedHistory = history;
+    let finalizer = SessionFinalizer::new(telemetry, registry, history, conn_id, client_addr);
+    async move { handle_session(socket, config, shutdown, finalizer, intercept).await }
 }
 
 async fn handle_session(
@@ -570,6 +716,7 @@ async fn handle_session(
     config: RelayConfig,
     shutdown: watch::Receiver<bool>,
     mut finalizer: SessionFinalizer,
+    intercept: Arc<InterceptCoordinator>,
 ) {
     let deadline = Instant::now() + config.negotiation_timeout;
 
@@ -703,7 +850,11 @@ async fn handle_session(
     // 4. Forwarding. Bytes the client sent after its request are already queued
     //    in the socket buffer and are read by the relay. The counters are owned
     //    by the finalizer, so progress stays readable if this task is aborted
-    //    mid-relay and the outcome never arrives.
+    //    mid-relay and the outcome never arrives. The observer records every
+    //    successfully forwarded byte run into passive history. The coordinator
+    //    holds traffic only for directions the control plane enabled (Phase 3);
+    //    by default both are off and this is the passive Phase 2 path.
+    let observer = SessionObserver::new(Arc::clone(&finalizer.history), finalizer.conn_id.clone());
     let outcome = relay_with_counters(
         socket,
         upstream.stream,
@@ -711,6 +862,8 @@ async fn handle_session(
         shutdown,
         Arc::clone(&finalizer.bytes_c2s),
         Arc::clone(&finalizer.bytes_s2c),
+        observer,
+        Some(intercept),
     )
     .await;
 
@@ -721,6 +874,33 @@ async fn write_selection(socket: &mut TcpStream) -> Result<(), std::io::Error> {
     use tokio::io::AsyncWriteExt;
     socket.write_all(&[SOCKS_VERSION, METHOD_NO_AUTH]).await?;
     socket.flush().await
+}
+
+/// Read and discard unread request bytes before framing a rejection reply.
+///
+/// Closing a socket with pending receive data makes Windows reset the
+/// connection, which discards even the reply bytes already delivered to the
+/// peer. Draining first turns the close into a graceful FIN carrying the
+/// truthful SOCKS failure. Bounded by byte cap and total budget so a slow
+/// or hostile client cannot pin the session slot; greeting-stage failures
+/// (which frame no reply) skip draining entirely.
+async fn drain_request_tail(socket: &mut TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let deadline = Instant::now() + REJECT_DRAIN_BUDGET;
+    let mut remaining = REJECT_DRAIN_CAP_BYTES;
+    let mut probe = [0u8; 256];
+    while remaining > 0 {
+        let budget = deadline.saturating_duration_since(Instant::now());
+        if budget.is_zero() {
+            break;
+        }
+        let chunk = probe.len().min(remaining);
+        match tokio::time::timeout(budget, socket.read(&mut probe[..chunk])).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => remaining -= n,
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -762,12 +942,18 @@ mod lifecycle_tests {
         let conn_id = record.id.clone();
 
         // The production construction path, not a test-local copy of it.
+        let history = Arc::new(crate::history::MemoryHistory::default());
+        let intercept = crate::intercept::InterceptCoordinator::new(
+            crate::intercept::InterceptLimits::default(),
+        );
         let task = tokio::spawn(start_session(
             socket,
             RelayConfig::default(),
             shutdown_rx,
             shared,
             registry.clone(),
+            Arc::clone(&history),
+            intercept,
             conn_id.clone(),
             client_addr,
         ));
@@ -846,6 +1032,19 @@ mod lifecycle_tests {
             Some((6, 6)),
             "aborted session must still emit its terminal record with retained counters"
         );
+
+        // The abort path (Drop, not report_closed) must also leave a history
+        // close record with the same retained counters.
+        let history_record = history
+            .connection(&conn_id)
+            .expect("aborted session must leave a history close record");
+        assert!(history_record.is_closed());
+        assert_eq!(
+            history_record.close_reason.as_deref(),
+            Some("session aborted")
+        );
+        assert_eq!(history_record.bytes_client_to_server, 6);
+        assert_eq!(history_record.bytes_server_to_client, 6);
     }
 
     /// Aborting before the session future is first polled must still free the
@@ -875,12 +1074,17 @@ mod lifecycle_tests {
         let conn_id = record.id.clone();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        let intercept = crate::intercept::InterceptCoordinator::new(
+            crate::intercept::InterceptLimits::default(),
+        );
         let task = tokio::spawn(start_session(
             socket,
             RelayConfig::default(),
             shutdown_rx,
             shared,
             registry.clone(),
+            Arc::new(crate::history::MemoryHistory::default()),
+            intercept,
             conn_id.clone(),
             client_addr,
         ));
@@ -932,7 +1136,13 @@ mod lifecycle_tests {
         let Admission::Admitted(record) = registry.reserve(addr) else {
             panic!("admission");
         };
-        let mut finalizer = SessionFinalizer::new(sink, Arc::clone(&registry), record.id, addr);
+        let mut finalizer = SessionFinalizer::new(
+            sink,
+            Arc::clone(&registry),
+            Arc::new(crate::history::MemoryHistory::default()),
+            record.id,
+            addr,
+        );
         finalizer.set_destination("example".to_owned(), 443);
         let outcome = crate::transport::RelayOutcome {
             bytes_client_to_server: 7,
@@ -977,6 +1187,7 @@ mod lifecycle_tests {
         let mut finalizer = SessionFinalizer::new(
             Arc::new(PanicOnlyOnClose),
             Arc::clone(&registry),
+            Arc::new(crate::history::MemoryHistory::default()),
             record.id,
             addr,
         );
