@@ -63,6 +63,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
+use crate::burp_route::{BurpRoute, SharedBurpRouter, MAX_BURP_ROUTES};
 use crate::connection::ConnectionRegistry;
 use crate::history::{Direction, MemoryHistory};
 use crate::intercept::{DecisionError, InterceptAction, InterceptCoordinator};
@@ -107,6 +108,10 @@ const IPC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60)
 const REPEATER_INVALID_REQUEST: u32 = 4410;
 const REPEATER_BUSY: u32 = 4411;
 const REPEATER_UNKNOWN_SEND: u32 = 4412;
+
+/// RPC error codes for Burp route validation.
+const BURP_ROUTE_INVALID: u32 = 4420;
+const BURP_ROUTE_TOO_MANY: u32 = 4421;
 
 /// Handle to a running IPC server: bound address, the capability token
 /// the operator must configure into the client, and graceful shutdown.
@@ -161,6 +166,7 @@ struct IpcState {
     registry: Arc<ConnectionRegistry>,
     history: Arc<MemoryHistory>,
     intercept: Arc<InterceptCoordinator>,
+    burp_router: SharedBurpRouter,
     daemon_epoch: String,
     capability_token: String,
     /// Engine SOCKS listener address for the setup banner (e.g.
@@ -274,6 +280,7 @@ pub(crate) async fn spawn_ipc(
     registry: Arc<ConnectionRegistry>,
     history: Arc<MemoryHistory>,
     intercept: Arc<InterceptCoordinator>,
+    burp_router: SharedBurpRouter,
     socks_addr: SocketAddr,
 ) -> Result<IpcHandle, std::io::Error> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -294,6 +301,7 @@ pub(crate) async fn spawn_ipc(
         registry,
         history,
         intercept,
+        burp_router,
         daemon_epoch: daemon_epoch.clone(),
         capability_token: capability_token.clone(),
         socks_addr: socks_addr.to_string(),
@@ -659,6 +667,10 @@ async fn handle_request(
         Some(proto::RequestBody::RepeaterStatus(status)) => {
             Some(repeater_status(status, repeater_active, repeater_finished))
         }
+        Some(proto::RequestBody::ListBurpRoutes(_)) => {
+            Some(proto::ResponseBody::BurpRouteList(list_burp_routes(state)))
+        }
+        Some(proto::RequestBody::SetBurpRoutes(set)) => Some(set_burp_routes(state, set)),
         None => Some(proto::ResponseBody::Error(proto::Error {
             code: 4404,
             message: "empty request body".into(),
@@ -816,6 +828,11 @@ fn list_connections(state: &IpcState) -> proto::ConnectionList {
             // Live sessions have no terminal reason; closed ones retained
             // only in history report it below.
             close_reason: String::new(),
+            routed: conn.routed,
+            route_target: conn
+                .route_target
+                .map(|addr| addr.to_string())
+                .unwrap_or_default(),
         });
     }
 
@@ -833,10 +850,80 @@ fn list_connections(state: &IpcState) -> proto::ConnectionList {
             bytes_client_to_server: rec.bytes_client_to_server,
             bytes_server_to_client: rec.bytes_server_to_client,
             close_reason: rec.close_reason.clone().unwrap_or_default(),
+            routed: rec.routed,
+            route_target: rec
+                .route_target
+                .map(|addr| addr.to_string())
+                .unwrap_or_default(),
         });
     }
 
     proto::ConnectionList { connections: info }
+}
+
+fn list_burp_routes(state: &IpcState) -> proto::BurpRouteList {
+    proto::BurpRouteList {
+        routes: state
+            .burp_router
+            .list()
+            .iter()
+            .map(|route| proto::BurpRoute {
+                host_pattern: route.host_pattern.clone(),
+                port: route.port as u32,
+                burp_addr: route.burp_addr.to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn set_burp_routes(state: &IpcState, set: &proto::SetBurpRoutes) -> proto::ResponseBody {
+    if set.routes.len() > MAX_BURP_ROUTES {
+        return proto::ResponseBody::Error(proto::Error {
+            code: BURP_ROUTE_TOO_MANY,
+            message: format!(
+                "too many burp routes ({}); maximum is {MAX_BURP_ROUTES}",
+                set.routes.len()
+            ),
+        });
+    }
+    let mut validated = Vec::with_capacity(set.routes.len());
+    for route in &set.routes {
+        if route.host_pattern.is_empty() {
+            return proto::ResponseBody::Error(proto::Error {
+                code: BURP_ROUTE_INVALID,
+                message: "burp route host pattern must not be empty (use \"*\" for any host)"
+                    .into(),
+            });
+        }
+        if route.port > 65535 {
+            return proto::ResponseBody::Error(proto::Error {
+                code: BURP_ROUTE_INVALID,
+                message: format!("burp route port out of range: {}", route.port),
+            });
+        }
+        let burp_addr: std::net::SocketAddr = match route.burp_addr.parse() {
+            Ok(addr) => addr,
+            Err(_) => {
+                return proto::ResponseBody::Error(proto::Error {
+                    code: BURP_ROUTE_INVALID,
+                    message: format!("invalid burp listener address: {}", route.burp_addr),
+                });
+            }
+        };
+        if !burp_addr.ip().is_loopback() {
+            return proto::ResponseBody::Error(proto::Error {
+                code: BURP_ROUTE_INVALID,
+                message: format!("burp listener must be loopback: {}", route.burp_addr),
+            });
+        }
+        validated.push(BurpRoute {
+            host_pattern: route.host_pattern.clone(),
+            port: route.port as u16,
+            burp_addr,
+        });
+    }
+    state.burp_router.set_routes(validated);
+    proto::ResponseBody::BurpRouteList(list_burp_routes(state))
 }
 
 fn history_snapshot(state: &IpcState, hs: &proto::HistorySnapshot) -> proto::HistoryData {

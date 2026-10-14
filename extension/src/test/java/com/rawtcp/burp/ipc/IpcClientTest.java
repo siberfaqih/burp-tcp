@@ -437,4 +437,86 @@ class IpcClientTest {
             server.close();
         }
     }
+
+    @Test
+    void burpRouteRpcRoundTrip() throws Exception {
+        TestWebSocketServer server = new TestWebSocketServer(session -> {
+            try {
+                byte[] helloFrame = session.readBinary();
+                if (helloFrame == null) {
+                    return;
+                }
+                BurpTcp.Request hello = BurpTcp.ClientMessage.parseFrom(helloFrame).getRequest();
+                session.sendBinary(helloAck(hello.getRequestId()));
+
+                byte[] frame;
+                while ((frame = session.readBinary()) != null) {
+                    BurpTcp.Request request = BurpTcp.ClientMessage.parseFrom(frame).getRequest();
+                    BurpTcp.BurpRouteList list = BurpTcp.BurpRouteList.newBuilder()
+                            .addRoutes(BurpTcp.BurpRoute.newBuilder()
+                                    .setHostPattern("10.0.0.5")
+                                    .setPort(7007)
+                                    .setBurpAddr("127.0.0.1:8081"))
+                            .build();
+                    if (request.hasListBurpRoutes()) {
+                        session.sendBinary(BurpTcp.ServerMessage.newBuilder()
+                                .setResponse(BurpTcp.Response.newBuilder()
+                                        .setRequestId(request.getRequestId())
+                                        .setBurpRouteList(list))
+                                .build()
+                                .toByteArray());
+                    } else if (request.hasSetBurpRoutes()) {
+                        assertEquals(1, request.getSetBurpRoutes().getRoutesCount());
+                        assertEquals("10.0.0.5",
+                                request.getSetBurpRoutes().getRoutes(0).getHostPattern());
+                        session.sendBinary(BurpTcp.ServerMessage.newBuilder()
+                                .setResponse(BurpTcp.Response.newBuilder()
+                                        .setRequestId(request.getRequestId())
+                                        .setBurpRouteList(list))
+                                .build()
+                                .toByteArray());
+                        return;
+                    } else {
+                        throw new IOException("unexpected burp-route RPC");
+                    }
+                }
+            } catch (IOException ignored) {
+                // Test teardown.
+            }
+        });
+
+        IpcClient client = new IpcClient("test", "1.0");
+        CountDownLatch connected = new CountDownLatch(1);
+        client.addListener(new IpcListener() {
+            @Override
+            public void onConnected(BurpTcp.HelloAck ack) {
+                connected.countDown();
+            }
+
+            @Override
+            public void onDisconnected(String reason) {
+            }
+
+            @Override
+            public void onEvent(BurpTcp.Event event) {
+            }
+        });
+        try {
+            client.start("127.0.0.1", server.port(), "token");
+            assertTrue(connected.await(TIMEOUT_SECONDS, TimeUnit.SECONDS), "never connected");
+            BurpTcp.BurpRouteList listed = client.listBurpRoutes()
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertEquals(1, listed.getRoutesCount());
+            assertEquals("127.0.0.1:8081", listed.getRoutes(0).getBurpAddr());
+
+            BurpTcp.BurpRouteList stored = client.setBurpRoutes(
+                            java.util.List.of(listed.getRoutes(0)))
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertEquals(1, stored.getRoutesCount());
+            assertEquals(7007, stored.getRoutes(0).getPort());
+        } finally {
+            client.close();
+            server.close();
+        }
+    }
 }

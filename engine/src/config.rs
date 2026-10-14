@@ -8,6 +8,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use crate::burp_route::BurpRoute;
 use crate::history::HistoryLimits;
 use crate::intercept::InterceptLimits;
 
@@ -51,6 +52,11 @@ pub struct RelayConfig {
     /// channel drops events (counted in `ipc_dropped_events`). Default
     /// 64; tests may use a smaller value for deterministic saturation.
     pub ipc_event_capacity: usize,
+    /// Static destination routes relayed through a Burp Proxy listener
+    /// instead of dialled directly. Empty disables routing; entries are
+    /// evaluated in order and the first match wins. IPC `SetBurpRoutes`
+    /// replaces this table at runtime.
+    pub burp_routes: Vec<BurpRoute>,
 }
 
 impl Default for RelayConfig {
@@ -66,6 +72,7 @@ impl Default for RelayConfig {
             intercept_limits: InterceptLimits::default(),
             ipc_port: None,
             ipc_event_capacity: 64,
+            burp_routes: Vec::new(),
         }
     }
 }
@@ -135,6 +142,12 @@ impl RelayConfig {
         self
     }
 
+    /// Set the static Burp routing table (order matters: first match wins).
+    pub fn with_burp_routes(mut self, routes: Vec<BurpRoute>) -> Self {
+        self.burp_routes = routes;
+        self
+    }
+
     /// Reject configurations that cannot be served safely.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.max_connections == 0 {
@@ -167,6 +180,21 @@ impl RelayConfig {
         if !self.is_loopback() {
             return Err(ConfigError::NonLoopbackBind {
                 addr: self.bind_addr,
+            });
+        }
+        for route in &self.burp_routes {
+            if route.host_pattern.is_empty() {
+                return Err(ConfigError::EmptyBurpRouteHost);
+            }
+            if !route.burp_addr.ip().is_loopback() {
+                return Err(ConfigError::NonLoopbackBurpAddr {
+                    addr: route.burp_addr,
+                });
+            }
+        }
+        if self.burp_routes.len() > crate::burp_route::MAX_BURP_ROUTES {
+            return Err(ConfigError::TooManyBurpRoutes {
+                count: self.burp_routes.len(),
             });
         }
         Ok(())
@@ -202,6 +230,18 @@ pub enum ConfigError {
     NonLoopbackBind {
         addr: IpAddr,
     },
+    /// A Burp route has an empty host pattern, which would never match
+    /// honestly (use `"*"` for any host).
+    EmptyBurpRouteHost,
+    /// A Burp route points at a non-loopback listener. Routing is a
+    /// loopback-only handoff to a local Burp Proxy listener.
+    NonLoopbackBurpAddr {
+        addr: std::net::SocketAddr,
+    },
+    /// More Burp routes than the bounded table supports.
+    TooManyBurpRoutes {
+        count: usize,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -223,6 +263,19 @@ impl fmt::Display for ConfigError {
             }
             Self::NonLoopbackBind { addr } => {
                 write!(f, "Phase 1A binds loopback only; refusing to bind {addr}")
+            }
+            Self::EmptyBurpRouteHost => {
+                f.write_str("burp route host pattern must not be empty (use \"*\" for any host)")
+            }
+            Self::NonLoopbackBurpAddr { addr } => {
+                write!(f, "burp route listener must be loopback: {addr}")
+            }
+            Self::TooManyBurpRoutes { count } => {
+                write!(
+                    f,
+                    "too many burp routes ({count}); maximum is {}",
+                    crate::burp_route::MAX_BURP_ROUTES
+                )
             }
         }
     }

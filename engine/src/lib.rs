@@ -13,6 +13,7 @@
 //! disabled by default; a relay that never enables it behaves exactly like
 //! the passive engine.
 
+pub mod burp_route;
 pub mod config;
 pub mod connection;
 pub mod error;
@@ -25,6 +26,7 @@ pub mod socks5;
 pub mod telemetry;
 pub mod transport;
 
+pub use burp_route::{BurpRoute, BurpRouter, SharedBurpRouter, MAX_BURP_ROUTES};
 pub use config::{ConfigError, RelayConfig};
 pub use connection::{ConnectionRegistry, ConnectionState};
 pub use error::{ServeError, SocksError};
@@ -40,4 +42,4 @@ pub use listener::{serve, spawn_relay, spawn_relay_with, RunningRelay};
 pub use telemetry::{
     memory_telemetry, Event, MemoryTelemetry, SharedTelemetry, StderrTelemetry, Telemetry,
 };
-pub use transport::{RelayOutcome, UpstreamConnection};
+pub use transport::{dial_burp, RelayOutcome, UpstreamConnection};

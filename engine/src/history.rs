@@ -138,6 +138,10 @@ pub struct ConnectionOpen {
     pub requested_port: u16,
     /// Endpoint actually dialled after resolution.
     pub resolved_upstream: SocketAddr,
+    /// True when relayed through a Burp Proxy listener.
+    pub routed: bool,
+    /// Burp listener endpoint, when routed.
+    pub route_target: Option<SocketAddr>,
 }
 
 /// Metadata supplied when a forwarding session ends.
@@ -176,6 +180,10 @@ pub struct ConnectionRecord {
     pub requested_port: u16,
     /// Endpoint actually dialled after resolution, when known.
     pub resolved_upstream: Option<SocketAddr>,
+    /// True when relayed through a Burp Proxy listener.
+    pub routed: bool,
+    /// Burp listener endpoint, when routed.
+    pub route_target: Option<SocketAddr>,
     /// Wall-clock (UTC) time the session started forwarding, if the open
     /// record was retained. `None` means the open was evicted under
     /// pressure (or its Open operation was dropped) before the close
@@ -607,6 +615,8 @@ impl MemoryHistory {
                     requested_target: rejected.requested_target,
                     requested_port: rejected.requested_port,
                     resolved_upstream: None,
+                    routed: false,
+                    route_target: None,
                     opened_wall: None,
                     opened_mono: None,
                     closed_wall: Some(at.wall),
@@ -622,6 +632,8 @@ impl MemoryHistory {
                     requested_target: open.requested_target,
                     requested_port: open.requested_port,
                     resolved_upstream: Some(open.resolved_upstream),
+                    routed: open.routed,
+                    route_target: open.route_target,
                     opened_wall: Some(at.wall),
                     opened_mono: Some(at.mono),
                     closed_wall: None,
@@ -650,6 +662,8 @@ impl MemoryHistory {
                             requested_target: String::from("-"),
                             requested_port: 0,
                             resolved_upstream: None,
+                            routed: false,
+                            route_target: None,
                             opened_wall: None,
                             opened_mono: None,
                             closed_wall: Some(at.wall),
@@ -853,6 +867,8 @@ mod tests {
             requested_target: "127.0.0.1".to_owned(),
             requested_port: 1433,
             resolved_upstream: "127.0.0.1:1433".parse().expect("addr"),
+            routed: false,
+            route_target: None,
         }
     }
 

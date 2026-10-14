@@ -34,6 +34,18 @@ pub async fn dial_upstream(
     connect_first(addrs, connect_timeout).await
 }
 
+/// Establish a TCP connection to a Burp Proxy listener for a routed session.
+///
+/// The original SOCKS destination is preserved in history; only the dial
+/// target changes. A refused listener surfaces as `CONNECTION_REFUSED` so
+/// the client sees the same reply shape as a refused upstream.
+pub async fn dial_burp(
+    burp_addr: SocketAddr,
+    connect_timeout: Duration,
+) -> Result<UpstreamConnection, SocksError> {
+    connect_first(vec![burp_addr], connect_timeout).await
+}
+
 async fn resolve(target: &RequestTarget, port: u16) -> Result<Vec<SocketAddr>, SocksError> {
     match target {
         RequestTarget::Ipv4(address) => Ok(vec![SocketAddr::from((*address, port))]),

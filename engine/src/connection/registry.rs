@@ -38,6 +38,11 @@ pub struct Connection {
     pub bytes_c2s: Arc<AtomicU64>,
     /// Forwarded bytes in the reverse direction.
     pub bytes_s2c: Arc<AtomicU64>,
+    /// True when this session is relayed through a Burp Proxy listener
+    /// instead of dialled directly.
+    pub routed: bool,
+    /// Burp listener endpoint, when routed.
+    pub route_target: Option<SocketAddr>,
 }
 
 /// Result of trying to admit an accepted socket.
@@ -89,6 +94,8 @@ impl ConnectionRegistry {
             state: ConnectionState::Negotiating,
             bytes_c2s: Arc::new(AtomicU64::new(0)),
             bytes_s2c: Arc::new(AtomicU64::new(0)),
+            routed: false,
+            route_target: None,
         };
         guard.push(connection.clone());
         self.accepted
@@ -133,6 +140,14 @@ impl ConnectionRegistry {
     pub fn mark_forwarding(&self, id: &str) {
         self.update(id, |connection| {
             connection.state = ConnectionState::Forwarding;
+        });
+    }
+
+    /// Mark a connection as relayed through a Burp Proxy listener.
+    pub fn mark_routed(&self, id: &str, route_target: SocketAddr) {
+        self.update(id, |connection| {
+            connection.routed = true;
+            connection.route_target = Some(route_target);
         });
     }
 

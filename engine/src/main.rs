@@ -5,7 +5,7 @@
 //! rawtcp-engine [--bind ADDR] [--port PORT] [--connect-timeout-ms MS]
 //!               [--negotiation-timeout-ms MS] [--max-connections N]
 //!               [--buffer-bytes N] [--ipc-port PORT]
-//!               [--ipc-event-capacity N]
+//!               [--ipc-event-capacity N] [--burp-route HOST[:PORT]=>BURP_ADDR]...
 //! ```
 //!
 //! Defaults bind `127.0.0.1:1080`. Ctrl-C stops the listener gracefully.
@@ -14,12 +14,19 @@
 //! `127.0.0.1:PORT` (0 = ephemeral). When enabled, the startup banner
 //! prints the endpoint, the per-launch capability token, and the daemon
 //! epoch the operator pastes into the Burp Raw TCP extension.
+//!
+//! `--burp-route` hands matching SOCKS destinations to a local Burp Proxy
+//! listener instead of dialling them directly, so native Burp Proxy history,
+//! Intercept, Repeater, and Scanner can be used. Repeat for multiple rules;
+//! the first match wins. Example: `--burp-route 10.0.0.5:7007=>127.0.0.1:8081`.
+//! Point a Burp Proxy listener at the Burp address with invisible proxying
+//! and a redirect to the real target.
 
 use std::net::IpAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use rawtcp_engine::{spawn_relay, RelayConfig};
+use rawtcp_engine::{spawn_relay, BurpRoute, RelayConfig};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -44,6 +51,19 @@ async fn main() -> ExitCode {
     // the engine is loopback-only.
     eprintln!("SOCKS5 relay listening on {}", relay.local_addr());
 
+    let routed = relay.burp_router().list();
+    if !routed.is_empty() {
+        eprintln!("Burp routes ({}):", routed.len());
+        for route in &routed {
+            let port = if route.port == 0 {
+                String::from("*")
+            } else {
+                route.port.to_string()
+            };
+            eprintln!("  {}:{} => {}", route.host_pattern, port, route.burp_addr);
+        }
+    }
+
     // Phase 4B: the control-plane endpoint and per-launch token the operator
     // pastes into the Burp Raw TCP extension. Printed only when IPC is enabled.
     if let Some(ipc) = relay.ipc() {
@@ -64,7 +84,8 @@ async fn main() -> ExitCode {
 /// Usage string shared by the argument-error path.
 const USAGE: &str = "usage: rawtcp-engine [--bind ADDR] [--port PORT] \
 [--connect-timeout-ms MS] [--negotiation-timeout-ms MS] [--max-connections N] \
-[--buffer-bytes N] [--ipc-port PORT] [--ipc-event-capacity N]";
+[--buffer-bytes N] [--ipc-port PORT] [--ipc-event-capacity N] \
+[--burp-route HOST[:PORT]=>BURP_ADDR]...";
 
 fn parse_args<I>(args: I) -> Result<RelayConfig, String>
 where
@@ -150,6 +171,11 @@ where
                 }
                 config.ipc_event_capacity = parsed;
             }
+            "--burp-route" => {
+                let raw = take_value("--burp-route")?;
+                let route = BurpRoute::parse(&raw)?;
+                config.burp_routes.push(route);
+            }
             "--help" | "-h" => return Err("help requested".into()),
             other => return Err(format!("unrecognised argument: {other}")),
         }
@@ -218,6 +244,46 @@ mod tests {
     #[test]
     fn non_loopback_bind_is_rejected() {
         let err = parse(&["--bind", "0.0.0.0"]).expect_err("non-loopback rejected");
+        assert!(err.contains("loopback"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn burp_route_flag_parses_single_rule() {
+        let config =
+            parse(&["--burp-route", "10.0.0.5:7007=>127.0.0.1:8081"]).expect("parse burp route");
+        assert_eq!(config.burp_routes.len(), 1);
+        assert_eq!(config.burp_routes[0].host_pattern, "10.0.0.5");
+        assert_eq!(config.burp_routes[0].port, 7007);
+        assert_eq!(
+            config.burp_routes[0].burp_addr.to_string(),
+            "127.0.0.1:8081"
+        );
+    }
+
+    #[test]
+    fn burp_route_flag_is_repeatable_and_defaults_empty() {
+        let config = parse(&[]).expect("defaults parse");
+        assert!(config.burp_routes.is_empty());
+        let config = parse(&[
+            "--burp-route",
+            "*=>127.0.0.1:8080",
+            "--burp-route",
+            "example.com=>127.0.0.1:8081",
+        ])
+        .expect("parse burp routes");
+        assert_eq!(config.burp_routes.len(), 2);
+    }
+
+    #[test]
+    fn burp_route_flag_rejects_bad_rule() {
+        let err = parse(&["--burp-route", "not-a-rule"]).expect_err("bad rule rejected");
+        assert!(err.contains("burp-route"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn burp_route_flag_rejects_non_loopback_listener() {
+        let err = parse(&["--burp-route", "*=>192.168.1.1:8080"])
+            .expect_err("non-loopback burp addr rejected");
         assert!(err.contains("loopback"), "unexpected error: {err}");
     }
 }

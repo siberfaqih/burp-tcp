@@ -48,6 +48,7 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
     private final HistoryPanel history;
     private final InterceptPanel intercept;
     private final RepeaterWorkspace repeater;
+    private final BurpRoutePanel burpRoute;
     private final JTabbedPane tabs = new JTabbedPane();
     private final UrlToolsPanel decoder = new UrlToolsPanel();
     private boolean connected;
@@ -79,6 +80,7 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
         this.history = new HistoryPanel(client);
         this.intercept = new InterceptPanel(client);
         this.repeater = new RepeaterWorkspace(client);
+        this.burpRoute = new BurpRoutePanel(client);
 
         connections.setSelectionListener(history::setConnection);
         connections.setSnapshotListener(rows -> {
@@ -120,6 +122,7 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
         tabs.addTab("Intercept", intercept);
         tabs.addTab("TCP history", history);
         tabs.addTab("Repeater", repeater);
+        tabs.addTab("Burp Route", burpRoute);
         tabs.addTab("Decoder", decoder);
         tabs.addTab("Connections", connections);
 
@@ -218,6 +221,7 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
         history.clear();
         intercept.setConnected(false);
         repeater.setConnected(false);
+        burpRoute.setConnected(false);
         statusTimer.stop();
         client.removeListener(this);
     }
@@ -309,6 +313,8 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
             lastDisconnectReason = "";
             intercept.setConnected(true);
             repeater.setConnected(true);
+            burpRoute.setConnected(true);
+            burpRoute.refresh();
             connections.refresh();
             intercept.refreshAll();
             updateBanner();
@@ -336,6 +342,7 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
         history.clear();
         intercept.setConnected(false);
         repeater.setConnected(false);
+        burpRoute.setConnected(false);
     }
 
     @Override
@@ -397,5 +404,9 @@ public final class RawTcpPanel extends JPanel implements IpcListener {
 
     RepeaterPanel repeaterPanel() {
         return repeater.selected();
+    }
+
+    BurpRoutePanel burpRoutePanel() {
+        return burpRoute;
     }
 }

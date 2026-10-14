@@ -23,6 +23,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
+use crate::burp_route::{BurpRouter, SharedBurpRouter};
 use crate::config::RelayConfig;
 use crate::connection::{Admission, ConnectionRegistry};
 use crate::error::{reply, ServeError, SocksError};
@@ -34,7 +35,7 @@ use crate::socks5::greeting::{read_greeting, write_no_acceptable, METHOD_NO_AUTH
 use crate::socks5::reply::write_reply;
 use crate::socks5::request::read_request;
 use crate::telemetry::{Event, SharedTelemetry, StderrTelemetry};
-use crate::transport::{dial_upstream, relay_with_counters, wait_for_shutdown};
+use crate::transport::{dial_burp, dial_upstream, relay_with_counters, wait_for_shutdown};
 
 /// Fallback address for logs when a socket has no local address.
 const UNKNOWN_ADDR: SocketAddr =
@@ -61,6 +62,7 @@ pub struct RunningRelay {
     registry: Arc<ConnectionRegistry>,
     history: Arc<MemoryHistory>,
     intercept: Arc<InterceptCoordinator>,
+    burp_router: SharedBurpRouter,
     ipc: Option<crate::ipc::IpcHandle>,
 }
 
@@ -94,6 +96,13 @@ impl RunningRelay {
     /// must be configured into the control-plane client.
     pub fn ipc(&self) -> Option<&crate::ipc::IpcHandle> {
         self.ipc.as_ref()
+    }
+
+    /// Destination routing table for Burp Proxy handoff. Shared with the
+    /// SOCKS supervisor and the IPC server, so `SetBurpRoutes` takes
+    /// effect on subsequently accepted sessions.
+    pub fn burp_router(&self) -> SharedBurpRouter {
+        Arc::clone(&self.burp_router)
     }
 
     /// Ask the engine to stop accepting and to close live sessions.
@@ -152,6 +161,7 @@ pub async fn serve(
     let registry = Arc::new(ConnectionRegistry::new(config.max_connections));
     let history = Arc::new(MemoryHistory::new(config.history_limits));
     let intercept = InterceptCoordinator::new(config.intercept_limits);
+    let burp_router: SharedBurpRouter = Arc::new(BurpRouter::new(config.burp_routes.clone()));
     accept_loop(
         listener,
         config,
@@ -159,6 +169,7 @@ pub async fn serve(
         registry,
         Arc::clone(&history),
         Arc::clone(&intercept),
+        Arc::clone(&burp_router),
         shutdown,
     )
     .await;
@@ -185,6 +196,7 @@ pub async fn spawn_relay_with(
     let registry = Arc::new(ConnectionRegistry::new(config.max_connections));
     let history = Arc::new(MemoryHistory::new(config.history_limits));
     let intercept = InterceptCoordinator::new(config.intercept_limits);
+    let burp_router: SharedBurpRouter = Arc::new(BurpRouter::new(config.burp_routes.clone()));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Start the IPC server if configured. The capability token is
@@ -201,6 +213,7 @@ pub async fn spawn_relay_with(
                 Arc::clone(&registry),
                 Arc::clone(&history),
                 Arc::clone(&intercept),
+                Arc::clone(&burp_router),
                 local_addr,
             )
             .await
@@ -220,6 +233,7 @@ pub async fn spawn_relay_with(
         Arc::clone(&registry),
         Arc::clone(&history),
         Arc::clone(&intercept),
+        Arc::clone(&burp_router),
         shutdown_rx,
     ));
 
@@ -230,6 +244,7 @@ pub async fn spawn_relay_with(
         registry,
         history,
         intercept,
+        burp_router,
         ipc,
     })
 }
@@ -248,6 +263,10 @@ async fn bind_listener(config: &RelayConfig) -> Result<TcpListener, ServeError> 
         })
 }
 
+/// Eight parameters is the honest shape of everything the supervisor owns
+/// (socket, config, telemetry, registry, history, interception, Burp
+/// routing, shutdown); bundling them would hide the construction order.
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: TcpListener,
     config: RelayConfig,
@@ -255,6 +274,7 @@ async fn accept_loop(
     registry: Arc<ConnectionRegistry>,
     history: Arc<MemoryHistory>,
     intercept: Arc<InterceptCoordinator>,
+    burp_router: SharedBurpRouter,
     shutdown: watch::Receiver<bool>,
 ) {
     // Session tasks are tracked so shutdown can drain them instead of
@@ -332,6 +352,7 @@ async fn accept_loop(
                     Arc::clone(&registry),
                     Arc::clone(&history),
                     Arc::clone(&intercept),
+                    Arc::clone(&burp_router),
                     conn_id.clone(),
                     client_addr,
                 );
@@ -472,6 +493,8 @@ struct SessionFinalizer {
     requested_target: Option<String>,
     requested_port: Option<u16>,
     resolved_upstream: Option<SocketAddr>,
+    routed: bool,
+    route_target: Option<SocketAddr>,
     established: bool,
     bytes_c2s: Arc<AtomicU64>,
     bytes_s2c: Arc<AtomicU64>,
@@ -496,6 +519,8 @@ impl SessionFinalizer {
             requested_target: None,
             requested_port: None,
             resolved_upstream: None,
+            routed: false,
+            route_target: None,
             established: false,
             bytes_c2s: Arc::new(AtomicU64::new(0)),
             bytes_s2c: Arc::new(AtomicU64::new(0)),
@@ -509,6 +534,13 @@ impl SessionFinalizer {
             .set_destination(&self.conn_id, target.clone(), port);
         self.requested_target = Some(target);
         self.requested_port = Some(port);
+    }
+
+    /// Mark this session as relayed through a Burp Proxy listener.
+    fn mark_routed(&mut self, route_target: SocketAddr) {
+        self.routed = true;
+        self.route_target = Some(route_target);
+        self.registry.mark_routed(&self.conn_id, route_target);
     }
 
     /// Transition to forwarding and emit `ConnectionEstablished`.
@@ -534,6 +566,8 @@ impl SessionFinalizer {
                 .unwrap_or_else(|| String::from("-")),
             requested_port: self.requested_port.unwrap_or(0),
             resolved_upstream,
+            routed: self.routed,
+            route_target: self.route_target,
         });
         self.telemetry.emit(Event::ConnectionEstablished {
             conn_id: self.conn_id.clone(),
@@ -728,12 +762,13 @@ fn start_session(
     registry: Arc<ConnectionRegistry>,
     history: Arc<MemoryHistory>,
     intercept: Arc<InterceptCoordinator>,
+    burp_router: SharedBurpRouter,
     conn_id: String,
     client_addr: SocketAddr,
 ) -> impl std::future::Future<Output = ()> + Send {
     let history: SharedHistory = history;
     let finalizer = SessionFinalizer::new(telemetry, registry, history, conn_id, client_addr);
-    async move { handle_session(socket, config, shutdown, finalizer, intercept).await }
+    async move { handle_session(socket, config, shutdown, finalizer, intercept, burp_router).await }
 }
 
 async fn handle_session(
@@ -742,6 +777,7 @@ async fn handle_session(
     shutdown: watch::Receiver<bool>,
     mut finalizer: SessionFinalizer,
     intercept: Arc<InterceptCoordinator>,
+    burp_router: SharedBurpRouter,
 ) {
     let deadline = Instant::now() + config.negotiation_timeout;
 
@@ -826,10 +862,37 @@ async fn handle_session(
 
     let requested_target = request.target().display();
     let requested_port = request.port();
-    finalizer.set_destination(requested_target, requested_port);
+    finalizer.set_destination(requested_target.clone(), requested_port);
+
+    // Burp handoff: a matching route dials the local Burp Proxy listener
+    // instead of the original destination. The original destination stays
+    // in history; the resolved endpoint is the Burp listener.
+    let burp_target = burp_router.route_for(&requested_target, requested_port);
 
     // 3. Upstream connect. SOCKS success is only reported after this succeeds.
-    let upstream = tokio::select! {
+    let upstream = if let Some(burp_addr) = burp_target {
+        let dialed = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(shutdown.clone()) => {
+                finalizer
+                    .report_rejected(&mut socket, SocksError::EngineShutdown, true)
+                    .await;
+                return;
+            }
+            result = dial_burp(burp_addr, config.connect_timeout) => {
+                match result {
+                    Ok(upstream) => upstream,
+                    Err(error) => {
+                        finalizer.report_rejected(&mut socket, error, true).await;
+                        return;
+                    }
+                }
+            }
+        };
+        finalizer.mark_routed(burp_addr);
+        dialed
+    } else {
+        tokio::select! {
         biased;
         _ = wait_for_shutdown(shutdown.clone()) => {
             finalizer
@@ -845,6 +908,7 @@ async fn handle_session(
                     return;
                 }
             }
+        }
         }
     };
 
@@ -879,7 +943,15 @@ async fn handle_session(
     //    successfully forwarded byte run into passive history. The coordinator
     //    holds traffic only for directions the control plane enabled (Phase 3);
     //    by default both are off and this is the passive Phase 2 path.
+    //    Routed sessions bypass interception entirely: Burp owns the hold
+    //    queue there, and a second engine queue would need two Forward
+    //    clicks per chunk.
     let observer = SessionObserver::new(Arc::clone(&finalizer.history), finalizer.conn_id.clone());
+    let intercept_plane = if finalizer.routed {
+        None
+    } else {
+        Some(intercept)
+    };
     let outcome = relay_with_counters(
         socket,
         upstream.stream,
@@ -888,7 +960,7 @@ async fn handle_session(
         Arc::clone(&finalizer.bytes_c2s),
         Arc::clone(&finalizer.bytes_s2c),
         observer,
-        Some(intercept),
+        intercept_plane,
     )
     .await;
 
@@ -971,6 +1043,7 @@ mod lifecycle_tests {
         let intercept = crate::intercept::InterceptCoordinator::new(
             crate::intercept::InterceptLimits::default(),
         );
+        let burp_router: SharedBurpRouter = Arc::new(crate::burp_route::BurpRouter::new(vec![]));
         let task = tokio::spawn(start_session(
             socket,
             RelayConfig::default(),
@@ -979,6 +1052,7 @@ mod lifecycle_tests {
             registry.clone(),
             Arc::clone(&history),
             intercept,
+            burp_router,
             conn_id.clone(),
             client_addr,
         ));
@@ -1102,6 +1176,7 @@ mod lifecycle_tests {
         let intercept = crate::intercept::InterceptCoordinator::new(
             crate::intercept::InterceptLimits::default(),
         );
+        let burp_router: SharedBurpRouter = Arc::new(crate::burp_route::BurpRouter::new(vec![]));
         let task = tokio::spawn(start_session(
             socket,
             RelayConfig::default(),
@@ -1110,6 +1185,7 @@ mod lifecycle_tests {
             registry.clone(),
             Arc::new(crate::history::MemoryHistory::default()),
             intercept,
+            burp_router,
             conn_id.clone(),
             client_addr,
         ));

@@ -3,7 +3,8 @@
 Montoya API extension that provides the Burp Suite control plane for the
 `rawtcp-engine` SOCKS5 relay. It connects to the engine's authenticated
 localhost IPC server (Phase 4A) over a binary WebSocket and renders five
-workspace tabs: **Intercept**, **TCP history**, **Repeater**, **Decoder**, and **Connections**.
+workspace tabs: **Intercept**, **TCP history**, **Repeater**, **Burp Route**,
+**Decoder**, and **Connections**.
 
 The extension holds no relay state of its own. All connection, history, and
 interception data lives in the engine and is fetched on demand, so unloading
@@ -162,6 +163,16 @@ not reset that deadline.
   and URL-component modes. Each click decodes one layer; use **Use output as
   input** to explicitly decode another layer. Invalid escapes/UTF-8 are reported
   rather than replaced. Traffic imported into Decoder does not alter a held unit.
+- **Burp Route** — destinations the engine hands to a local Burp Proxy
+  listener instead of dialling directly, so native Proxy history, Intercept,
+  Repeater, Intruder, and Scanner can be used for plaintext HTTP. Rules are
+  `HOST[:PORT]=>127.0.0.1:PORT` (`*` matches any host, missing port matches
+  any port, first match wins); **Apply** pushes the table to the engine.
+  Burp setup: Proxy listener on the Burp address with invisible proxying and
+  a redirect to the real target. Routed sessions bypass Raw TCP intercept
+  (Burp owns the hold queue there) and show as `via Burp ...` in
+  Connections. Or start the engine with
+  `--burp-route 10.0.0.5:7007=>127.0.0.1:8081`.
 
 ### Body parameter workflow
 

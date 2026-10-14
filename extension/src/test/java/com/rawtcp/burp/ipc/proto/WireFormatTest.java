@@ -121,6 +121,47 @@ class WireFormatTest {
     }
 
     @Test
+    void burpRouteWireFormatIsStable() {
+        // field 1 string, field 2 varint, field 3 string.
+        BurpTcp.BurpRoute route = BurpTcp.BurpRoute.newBuilder()
+                .setHostPattern("h")
+                .setPort(7)
+                .setBurpAddr("127.0.0.1:8081")
+                .build();
+        byte[] expected = {
+                0x0A, 0x01, 'h',
+                0x10, 0x07,
+                0x1A, 0x0E,
+                '1', '2', '7', '.', '0', '.', '0', '.', '1', ':', '8', '0', '8', '1',
+        };
+        assertArrayEquals(expected, route.toByteArray());
+    }
+
+    @Test
+    void routedConnectionInfoAppendsFields9And10() {
+        BurpTcp.ConnectionInfo direct = BurpTcp.ConnectionInfo.newBuilder()
+                .setConnId("c")
+                .setEstablished(true)
+                .build();
+        BurpTcp.ConnectionInfo routed = direct.toBuilder()
+                .setRouted(true)
+                .setRouteTarget("127.0.0.1:8081")
+                .build();
+        byte[] directBytes = direct.toByteArray();
+        byte[] routedBytes = routed.toByteArray();
+        // field 9 bool true = tag 0x48 value 0x01; field 10 string (14 bytes) = tag 0x52 len 0x0E.
+        assertEquals(directBytes.length + 2 + 16, routedBytes.length);
+        byte[] tail = {
+                0x48, 0x01,
+                0x52, 0x0E,
+                '1', '2', '7', '.', '0', '.', '0', '.', '1', ':', '8', '0', '8', '1',
+        };
+        for (int i = 0; i < tail.length; i++) {
+            assertEquals(tail[i], routedBytes[directBytes.length + i]);
+        }
+    }
+
+    @Test
     void decideRoundTripsThroughBytes() throws Exception {
         BurpTcp.ClientMessage original = BurpTcp.ClientMessage.newBuilder()
                 .setRequest(BurpTcp.Request.newBuilder()

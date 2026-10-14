@@ -39,6 +39,11 @@ planning documents.
   one send slot; offline URL Decoder tab.
 - **One-shot TCP repeater** (Phase 5): one approved send per click on a fresh
   engine-side connection, bounded response capture, no retries.
+- **Route through Burp**: SOCKS destinations matching a rule are relayed
+  byte-for-byte to a local Burp Proxy listener instead of dialled directly,
+  so native Proxy history, Intercept, Repeater, Intruder, and Scanner can be
+  used. Routed sessions bypass engine interception (Burp owns the hold queue
+  there) and are marked "via Burp" in Connections.
 
 ## Updates in this push
 
@@ -74,6 +79,29 @@ The engine prints the IPC endpoint, a per-launch capability token, and the
 daemon epoch. In Burp Suite: Extensions → Add the `.jar`, open the Raw TCP
 tab, enter the IPC port, paste the token, Connect. Route the target
 application through `127.0.0.1:1080` as its SOCKS5 proxy.
+
+## Route HTTP through Burp (native Proxy/Repeater/Intruder)
+
+For plaintext HTTP targets, hand the connection to Burp instead of editing
+raw TCP chunks:
+
+1. In Burp: Proxy → Proxy settings → add a Proxy listener on e.g.
+   `127.0.0.1:8081`, enable **invisible proxying**, and redirect to the
+   real target host/port (e.g. `10.239.130.131:7007`).
+2. In the Raw TCP → **Burp Route** tab, add a rule such as
+   `10.239.130.131:7007=>127.0.0.1:8081` and press **Apply** (or start the
+   engine with `--burp-route 10.239.130.131:7007=>127.0.0.1:8081`).
+3. Use Burp's Proxy history/Intercept/Repeater as usual. Routed sessions
+   appear as "via Burp ..." in Connections; engine intercept is bypassed
+   for them so there is no second Forward queue.
+4. Heartbeats still need Burp match/replace or scope exclusions once their
+   endpoints are known — changing the proxy path does not change
+   application timeouts.
+
+Rule format is `HOST[:PORT]=>BURP_ADDR`; `*` matches any host and a missing
+port matches any port. The first match wins. Burp listener addresses must
+be loopback. HTTPS needs Burp TLS handling (CA trusted by the target app)
+and is outside the plaintext path above.
 
 ## Scope and limits (read before pentesting bulk transfers)
 

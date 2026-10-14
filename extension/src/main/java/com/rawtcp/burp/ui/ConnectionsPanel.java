@@ -29,6 +29,7 @@ public final class ConnectionsPanel extends JPanel {
             BurpTcp.ConnectionInfo info = model.get(convertRowIndexToModel(row));
             String tip = "Connection " + info.getConnId();
             if (!info.getCloseReason().isEmpty()) tip += " · ended: " + info.getCloseReason();
+            if (info.getRouted()) tip += " · via Burp " + info.getRouteTarget();
             return tip;
         }
     };
@@ -131,7 +132,7 @@ public final class ConnectionsPanel extends JPanel {
     private static final class Model extends AbstractTableModel {
 
         private static final String[] COLUMNS =
-                {"#", "Host", "Port", "Status", "Sent (bytes)", "Received (bytes)", "Ended"};
+                {"#", "Host", "Port", "Status", "Sent (bytes)", "Received (bytes)", "Ended", "Via Burp"};
 
         private List<BurpTcp.ConnectionInfo> rows = new ArrayList<>();
 
@@ -173,7 +174,8 @@ public final class ConnectionsPanel extends JPanel {
                 case 3 -> Display.connectionState(info);
                 case 4 -> info.getBytesClientToServer();
                 case 5 -> info.getBytesServerToClient();
-                default -> info.getCloseReason();
+                case 6 -> info.getCloseReason();
+                default -> info.getRouted() ? "via Burp " + info.getRouteTarget() : "";
             };
         }
     }

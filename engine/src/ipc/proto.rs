@@ -208,6 +208,12 @@ pub struct ConnectionInfo {
     /// Terminal reason once closed (e.g. "eof"); "" while live.
     #[prost(string, tag = "8")]
     pub close_reason: String,
+    /// True when relayed through a Burp Proxy listener.
+    #[prost(bool, tag = "9")]
+    pub routed: bool,
+    /// Burp listener addr when routed, "" otherwise.
+    #[prost(string, tag = "10")]
+    pub route_target: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -337,6 +343,33 @@ pub struct Stats {
     pub active_connections: u64,
 }
 
+// --- Burp routing ---
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BurpRoute {
+    #[prost(string, tag = "1")]
+    pub host_pattern: String,
+    #[prost(uint32, tag = "2")]
+    pub port: u32,
+    #[prost(string, tag = "3")]
+    pub burp_addr: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ListBurpRoutes {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SetBurpRoutes {
+    #[prost(message, repeated, tag = "1")]
+    pub routes: Vec<BurpRoute>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BurpRouteList {
+    #[prost(message, repeated, tag = "1")]
+    pub routes: Vec<BurpRoute>,
+}
+
 // --- Events ---
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -383,13 +416,17 @@ pub enum RequestBody {
     RepeaterStop(RepeaterStop),
     #[prost(message, tag = "12")]
     RepeaterStatus(RepeaterStatus),
+    #[prost(message, tag = "13")]
+    ListBurpRoutes(ListBurpRoutes),
+    #[prost(message, tag = "14")]
+    SetBurpRoutes(SetBurpRoutes),
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Request {
     #[prost(uint32, tag = "1")]
     pub request_id: u32,
-    #[prost(oneof = "RequestBody", tags = "2,3,4,5,6,7,8,9,10,11,12")]
+    #[prost(oneof = "RequestBody", tags = "2,3,4,5,6,7,8,9,10,11,12,13,14")]
     pub body: Option<RequestBody>,
 }
 
@@ -417,13 +454,15 @@ pub enum ResponseBody {
     RepeaterStopResult(RepeaterStopResult),
     #[prost(message, tag = "12")]
     RepeaterStatusResult(RepeaterStatusResult),
+    #[prost(message, tag = "13")]
+    BurpRouteList(BurpRouteList),
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Response {
     #[prost(uint32, tag = "1")]
     pub request_id: u32,
-    #[prost(oneof = "ResponseBody", tags = "2,3,4,5,6,7,8,9,10,11,12")]
+    #[prost(oneof = "ResponseBody", tags = "2,3,4,5,6,7,8,9,10,11,12,13")]
     pub body: Option<ResponseBody>,
 }
 
@@ -552,6 +591,24 @@ mod tests {
     }
 
     #[test]
+    fn burp_route_wire_format_is_stable() {
+        // Must match the Java WireFormatTest bytes exactly: field 1 string,
+        // field 2 varint, field 3 string.
+        let route = BurpRoute {
+            host_pattern: "h".to_owned(),
+            port: 7,
+            burp_addr: "127.0.0.1:8081".to_owned(),
+        };
+        let expected = [
+            0x0A, 0x01, b'h', // host_pattern = "h"
+            0x10, 0x07, // port = 7
+            0x1A, 0x0E, // burp_addr, len 14
+            b'1', b'2', b'7', b'.', b'0', b'.', b'0', b'.', b'1', b':', b'8', b'0', b'8', b'1',
+        ];
+        assert_eq!(route.encode_to_vec(), expected);
+    }
+
+    #[test]
     fn connection_info_close_reason_wire_format_is_stable() {
         // New additive fields must encode exactly as protoc does: field 8
         // (close_reason) is tag 0x42. Empty fields are omitted entirely, so
@@ -565,6 +622,8 @@ mod tests {
             bytes_client_to_server: 0,
             bytes_server_to_client: 0,
             close_reason: String::new(),
+            routed: false,
+            route_target: String::new(),
         };
         let live_bytes = live.encode_to_vec();
         assert!(

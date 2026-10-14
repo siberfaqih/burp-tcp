@@ -333,6 +333,24 @@ public final class IpcClient implements IpcSession {
                         resp.getRepeaterStatusResult(), "RepeaterStatus"));
     }
 
+    @Override
+    public CompletableFuture<BurpTcp.BurpRouteList> listBurpRoutes() {
+        return request(r -> r.setListBurpRoutes(BurpTcp.ListBurpRoutes.getDefaultInstance()))
+                .thenApply(resp -> require(resp, resp.hasBurpRouteList(),
+                        resp.getBurpRouteList(), "ListBurpRoutes"));
+    }
+
+    @Override
+    public CompletableFuture<BurpTcp.BurpRouteList> setBurpRoutes(
+            java.util.List<BurpTcp.BurpRoute> routes) {
+        BurpTcp.SetBurpRoutes body = BurpTcp.SetBurpRoutes.newBuilder()
+                .addAllRoutes(routes == null ? java.util.List.of() : routes)
+                .build();
+        return request(r -> r.setSetBurpRoutes(body))
+                .thenApply(resp -> require(resp, resp.hasBurpRouteList(),
+                        resp.getBurpRouteList(), "SetBurpRoutes"));
+    }
+
     // --- Internals -----------------------------------------------------
 
     private CompletableFuture<BurpTcp.Response> request(Consumer<BurpTcp.Request.Builder> build) {

@@ -85,4 +85,31 @@ class ConnectionsPanelTest {
                     "live connections have no terminal reason");
         });
     }
+
+    @Test
+    void routedRowsShowBurpListener() throws Exception {
+        FakeControlPlane fake = new FakeControlPlane();
+        fake.listConnectionsResult = CompletableFuture.completedFuture(
+                BurpTcp.ConnectionList.newBuilder()
+                        .addConnections(BurpTcp.ConnectionInfo.newBuilder()
+                                .setConnId("routed")
+                                .setRequestedHost("10.0.0.9").setRequestedPort(7007)
+                                .setEstablished(true)
+                                .setRouted(true).setRouteTarget("127.0.0.1:8081"))
+                        .addConnections(BurpTcp.ConnectionInfo.newBuilder()
+                                .setConnId("direct")
+                                .setRequestedHost("10.0.0.9").setRequestedPort(7007)
+                                .setEstablished(true))
+                        .build());
+        AtomicReference<ConnectionsPanel> ref = new AtomicReference<>();
+        onEdt(() -> ref.set(new ConnectionsPanel(fake)));
+        onEdt(() -> ref.get().refresh());
+        flush();
+        onEdt(() -> {
+            assertEquals(2, ref.get().rowCount());
+            assertEquals("via Burp 127.0.0.1:8081", ref.get().cellValue(0, 7));
+            assertEquals("", ref.get().cellValue(1, 7),
+                    "direct connections show no Burp marker");
+        });
+    }
 }

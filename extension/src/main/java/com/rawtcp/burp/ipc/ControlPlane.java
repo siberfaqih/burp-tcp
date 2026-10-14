@@ -43,6 +43,15 @@ public interface ControlPlane {
 
     CompletableFuture<BurpTcp.RepeaterStatusResult> repeaterStatus(String sendId);
 
+    /** Current Burp routing table (destinations handed to a Burp Proxy listener). */
+    CompletableFuture<BurpTcp.BurpRouteList> listBurpRoutes();
+
+    /**
+     * Replace the Burp routing table; empty clears routing. Resolves with
+     * the table the engine stored.
+     */
+    CompletableFuture<BurpTcp.BurpRouteList> setBurpRoutes(java.util.List<BurpTcp.BurpRoute> routes);
+
     /** Human-readable connection status for the UI. */
     String status();
 

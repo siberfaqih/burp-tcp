@@ -54,6 +54,11 @@ public final class FakeControlPlane implements IpcSession {
             CompletableFuture.completedFuture(BurpTcp.RepeaterStopResult.getDefaultInstance());
     public volatile CompletableFuture<BurpTcp.RepeaterStatusResult> repeaterStatusResult =
             CompletableFuture.completedFuture(BurpTcp.RepeaterStatusResult.getDefaultInstance());
+    public volatile CompletableFuture<BurpTcp.BurpRouteList> burpRouteListResult =
+            CompletableFuture.completedFuture(BurpTcp.BurpRouteList.getDefaultInstance());
+    public final List<java.util.List<BurpTcp.BurpRoute>> setBurpRoutesCalls =
+            new CopyOnWriteArrayList<>();
+    public int listBurpRoutesCalls;
 
     private final List<IpcListener> listeners = new CopyOnWriteArrayList<>();
 
@@ -153,6 +158,19 @@ public final class FakeControlPlane implements IpcSession {
                 .setSendId(sendId)
                 .build());
         return repeaterStatusResult;
+    }
+
+    @Override
+    public CompletableFuture<BurpTcp.BurpRouteList> listBurpRoutes() {
+        listBurpRoutesCalls++;
+        return burpRouteListResult;
+    }
+
+    @Override
+    public CompletableFuture<BurpTcp.BurpRouteList> setBurpRoutes(
+            java.util.List<BurpTcp.BurpRoute> routes) {
+        setBurpRoutesCalls.add(List.copyOf(routes == null ? List.of() : routes));
+        return burpRouteListResult;
     }
 
     @Override

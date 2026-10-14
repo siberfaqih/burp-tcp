@@ -154,6 +154,28 @@ message RepeaterStatusResult {
   RepeaterResult result = 3;     // present only when finished
 }
 
+// --- Burp routing (SOCKS -> Burp Proxy handoff) ---
+
+// One destination rule: SOCKS targets matching host_pattern/port are
+// relayed to burp_addr instead of dialled directly. host_pattern is an
+// exact hostname/IPv4 (case-insensitive) or "*" for any host; port 0
+// means any port. burp_addr is a loopback Burp Proxy listener.
+message BurpRoute {
+  string host_pattern = 1;
+  uint32 port = 2;
+  string burp_addr = 3;          // e.g. "127.0.0.1:8081"
+}
+
+message ListBurpRoutes {}
+
+message SetBurpRoutes {
+  repeated BurpRoute routes = 1; // replace-all; empty clears routing
+}
+
+message BurpRouteList {
+  repeated BurpRoute routes = 1;
+}
+
 // --- RPC responses ---
 
 message ConnectionInfo {
@@ -165,6 +187,8 @@ message ConnectionInfo {
   uint64 bytes_client_to_server = 6;
   uint64 bytes_server_to_client = 7;
   string close_reason = 8;       // terminal reason once closed, "" while live
+  bool routed = 9;               // relayed through a Burp Proxy listener
+  string route_target = 10;      // Burp listener addr when routed, "" otherwise
 }
 message ConnectionList {
   repeated ConnectionInfo connections = 1;
@@ -252,6 +276,8 @@ message Request {
     RepeaterSend repeater_send = 10;
     RepeaterStop repeater_stop = 11;
     RepeaterStatus repeater_status = 12;
+    ListBurpRoutes list_burp_routes = 13;
+    SetBurpRoutes set_burp_routes = 14;
   }
 }
 
@@ -269,6 +295,7 @@ message Response {
     RepeaterStartResult repeater_start_result = 10;
     RepeaterStopResult repeater_stop_result = 11;
     RepeaterStatusResult repeater_status_result = 12;
+    BurpRouteList burp_route_list = 13;
   }
 }
 
